@@ -19,8 +19,16 @@
 //! reports at cell coordinates, plus focus in/out (1004); holding Shift
 //! bypasses reporting so selection stays reachable, per convention.
 //!
+//! Config (KDL, live-reloaded on file change): a `terminal { … }` section in
+//! the shared `~/.config/cce/config.kdl` or the per-app
+//! `~/.config/cce/cce-terminal/config.kdl` (app file wins) with `font_size`,
+//! `scrollback`, and a `colors { … }` block naming `foreground`, `background`,
+//! `cursor`, `selection`, and the 16 ANSI slots (`black` … `bright_white`)
+//! as hex strings. The font family comes from fontconfig's `terminal` alias,
+//! like the rest of the DE's font routing.
+//!
 //! Not yet: measured cell metrics (0.60 em / 1.2 em estimates — exact for
-//! Berkeley Mono in practice), KDL config for font size and palette.
+//! Berkeley Mono in practice).
 
 mod clip;
 mod colors;
@@ -44,21 +52,42 @@ use cce_ui::scene::paint::{DisplayList, PaintCtx, TextAttrs};
 use cce_ui::widget::{ElementState, Key, KeyEvent, MouseButton, MouseScrollDelta, NamedKey};
 use wayland_client::QueueHandle;
 
-const FONT_SIZE: f32 = 14.0;
-/// Toolkit conventions: ceil(font_size × 1.2) line height (`text_leaf_height`),
-/// 0.60 × font_size mono advance (`estimate_label_width_helper`).
-const LINE_H: f32 = 17.0;
-const CELL_W: f32 = FONT_SIZE * 0.60;
 const INIT_W: u32 = 840;
 const INIT_H: u32 = 520;
-const SCROLLBACK: usize = 5000;
 /// Wheel notches → scrollback lines.
 const SCROLL_LINES_PER_NOTCH: f32 = 3.0;
 /// Presses in the same cell within this window escalate Simple → Semantic →
 /// Lines selection.
 const MULTI_CLICK_WINDOW: Duration = Duration::from_millis(400);
-/// Selection highlight, over cell backgrounds and under glyphs.
-const SELECTION_RGB: Rgb = Rgb { r: 0xc8, g: 0xd0, b: 0xe0 };
+
+/// The KDL-configurable knobs (`terminal { … }` in the shared config.kdl or
+/// the per-app `~/.config/cce/cce-terminal/config.kdl`, app file winning) and
+/// the cell metrics derived from them. Toolkit conventions for the metrics:
+/// ceil(font_size × 1.2) line height (`text_leaf_height`), 0.60 × font_size
+/// mono advance (`estimate_label_width_helper`).
+#[derive(Clone, Copy, PartialEq)]
+struct Settings {
+    font_size: f32,
+    line_h: f32,
+    cell_w: f32,
+    scrollback: usize,
+    palette: colors::Palette,
+}
+
+impl Settings {
+    fn load() -> Self {
+        let font_size = cce_ui::config::get_f32("/terminal/font_size", 14.0).clamp(6.0, 72.0);
+        let scrollback =
+            cce_ui::config::get_i64("/terminal/scrollback", 5000).clamp(0, 200_000) as usize;
+        Settings {
+            font_size,
+            line_h: (font_size * 1.2).ceil(),
+            cell_w: font_size * 0.60,
+            scrollback,
+            palette: colors::Palette::from_config(),
+        }
+    }
+}
 
 #[derive(Clone)]
 enum Msg {
@@ -115,7 +144,13 @@ struct TerminalApp {
     /// Multi-click escalation state: last press instant + cell.
     last_click: Option<(Instant, Point)>,
     click_count: u8,
-    /// Current window size (for selection edge-autoscroll bounds).
+    settings: Settings,
+    /// Config-file mtime at the last (re)load — tick polls it so palette and
+    /// font-size edits apply live, per the DE's edit-the-file convention.
+    config_stamp: Option<std::time::SystemTime>,
+    /// Current window size (for grid re-derivation on config reload and
+    /// selection edge-autoscroll bounds).
+    win_w: f32,
     win_h: f32,
     /// Modifier state tracked from key events (mouse handlers receive no
     /// modifiers). Shift bypasses mouse reporting; ctrl/alt ride report codes.
@@ -130,9 +165,7 @@ struct TerminalApp {
 
 impl TerminalApp {
     fn grid_for(&self, w: f32, h: f32) -> (u16, u16) {
-        let cols = (((w - 2.0 * self.pad) / CELL_W).floor() as i64).clamp(2, u16::MAX as i64);
-        let rows = (((h - 2.0 * self.pad) / LINE_H).floor() as i64).clamp(1, u16::MAX as i64);
-        (cols as u16, rows as u16)
+        grid_dims(w, h, self.pad, &self.settings)
     }
 
     fn write_pty(&mut self, bytes: &[u8]) {
@@ -141,18 +174,18 @@ impl TerminalApp {
 
     fn cell_rect(&self, row: usize, col: usize, width_cells: usize) -> Rect {
         Rect {
-            x: self.pad + col as f32 * CELL_W,
-            y: self.pad + row as f32 * LINE_H,
-            width: width_cells as f32 * CELL_W,
-            height: LINE_H,
+            x: self.pad + col as f32 * self.settings.cell_w,
+            y: self.pad + row as f32 * self.settings.line_h,
+            width: width_cells as f32 * self.settings.cell_w,
+            height: self.settings.line_h,
         }
     }
 
     /// Pixel position → 0-based viewport cell (clamped).
     fn viewport_cell(&self, pos: LogicalPosition) -> (usize, usize) {
-        let col = (((pos.x as f32 - self.pad) / CELL_W).max(0.0) as usize)
+        let col = (((pos.x as f32 - self.pad) / self.settings.cell_w).max(0.0) as usize)
             .min(self.cols as usize - 1);
-        let row = (((pos.y as f32 - self.pad) / LINE_H).max(0.0) as usize)
+        let row = (((pos.y as f32 - self.pad) / self.settings.line_h).max(0.0) as usize)
             .min(self.rows as usize - 1);
         (col, row)
     }
@@ -162,7 +195,7 @@ impl TerminalApp {
     /// cell was hit.
     fn grid_point(&self, pos: LogicalPosition) -> (Point, Side) {
         let (col, row) = self.viewport_cell(pos);
-        let col_f = ((pos.x as f32 - self.pad) / CELL_W).max(0.0);
+        let col_f = ((pos.x as f32 - self.pad) / self.settings.cell_w).max(0.0);
         let line = Line(row as i32 - self.term.grid().display_offset() as i32);
         let side = if col_f.fract() > 0.5 { Side::Right } else { Side::Left };
         (Point::new(line, Column(col)), side)
@@ -243,6 +276,12 @@ fn paste_bytes(text: &str, bracketed: bool) -> Vec<u8> {
     } else {
         text.replace("\r\n", "\r").replace('\n', "\r").into_bytes()
     }
+}
+
+fn grid_dims(w: f32, h: f32, pad: f32, settings: &Settings) -> (u16, u16) {
+    let cols = (((w - 2.0 * pad) / settings.cell_w).floor() as i64).clamp(2, u16::MAX as i64);
+    let rows = (((h - 2.0 * pad) / settings.line_h).floor() as i64).clamp(1, u16::MAX as i64);
+    (cols as u16, rows as u16)
 }
 
 /// Terminal-space RGB → cce-ui quad color (the geometry pipeline is linear;
@@ -353,8 +392,9 @@ impl Application for TerminalApp {
         sender: calloop::channel::Sender<Self::Message>,
     ) -> Self {
         let pad = cce_ui::layout::backplate_padding();
-        let cols = (((INIT_W as f32 - 2.0 * pad) / CELL_W) as i64).clamp(2, u16::MAX as i64) as u16;
-        let rows = (((INIT_H as f32 - 2.0 * pad) / LINE_H) as i64).clamp(1, u16::MAX as i64) as u16;
+        let settings = Settings::load();
+        let config_stamp = cce_ui::config::config_files_modified();
+        let (cols, rows) = grid_dims(INIT_W as f32, INIT_H as f32, pad, &settings);
 
         // `cce-terminal -e <cmd> [args…]` runs a command instead of $SHELL.
         let args: Vec<String> = std::env::args().collect();
@@ -387,7 +427,8 @@ impl Application for TerminalApp {
             let _ = pty_sender.send(Msg::PtyClosed);
         });
 
-        let config = TermConfig { scrolling_history: SCROLLBACK, ..TermConfig::default() };
+        let config =
+            TermConfig { scrolling_history: settings.scrollback, ..TermConfig::default() };
         let term = Term::new(config, &TermDims { cols, rows }, EventProxy(sender));
 
         // Index 6 of the preferred-fonts tuple is the `terminal` alias
@@ -409,6 +450,9 @@ impl Application for TerminalApp {
             selecting: false,
             last_click: None,
             click_count: 0,
+            settings,
+            config_stamp,
+            win_w: INIT_W as f32,
             win_h: INIT_H as f32,
             shift_down: false,
             ctrl_down: false,
@@ -453,7 +497,7 @@ impl Application for TerminalApp {
                     let rgb = self
                         .term
                         .colors()[index]
-                        .unwrap_or_else(|| colors::default_color(index));
+                        .unwrap_or_else(|| colors::default_color(index, &self.settings.palette));
                     let response = format(rgb);
                     self.write_pty(response.as_bytes());
                 }
@@ -461,8 +505,8 @@ impl Application for TerminalApp {
                     let response = format(WindowSize {
                         num_lines: self.rows,
                         num_cols: self.cols,
-                        cell_width: CELL_W as u16,
-                        cell_height: LINE_H as u16,
+                        cell_width: self.settings.cell_w as u16,
+                        cell_height: self.settings.line_h as u16,
                     });
                     self.write_pty(response.as_bytes());
                 }
@@ -489,9 +533,32 @@ impl Application for TerminalApp {
         }
     }
 
-    fn tick(&mut self, _dt: f32, _needs_rebuild: &mut bool) {}
+    /// Config edits apply live: poll the config files' mtime (the toolkit's
+    /// own getters stat them on every call anyway) and re-derive settings,
+    /// grid, and pty size on change. Scrollback capacity is the exception —
+    /// it's baked into the Term at startup.
+    fn tick(&mut self, _dt: f32, needs_rebuild: &mut bool) {
+        let stamp = cce_ui::config::config_files_modified();
+        if stamp == self.config_stamp {
+            return;
+        }
+        self.config_stamp = stamp;
+        let reloaded = Settings::load();
+        let old = std::mem::replace(&mut self.settings, reloaded);
+        if reloaded != old {
+            *needs_rebuild = true;
+            let (cols, rows) = self.grid_for(self.win_w, self.win_h);
+            if (cols, rows) != (self.cols, self.rows) {
+                self.cols = cols;
+                self.rows = rows;
+                self.pty.resize(cols, rows);
+                self.term.resize(TermDims { cols, rows });
+            }
+        }
+    }
 
     fn handle_resize(&mut self, width: f32, height: f32, _scale: f64) {
+        self.win_w = width;
         self.win_h = height;
         let (cols, rows) = self.grid_for(width, height);
         if (cols, rows) != (self.cols, self.rows) {
@@ -522,7 +589,8 @@ impl Application for TerminalApp {
 
         let content = self.term.renderable_content();
         let display_offset = content.display_offset as i32;
-        let palette = content.colors;
+        let overrides = content.colors;
+        let cfg_palette = self.settings.palette;
 
         // One ordered pass over the viewport cells, batching backgrounds and
         // same-style text into runs. Emission order: bg quads → text →
@@ -557,7 +625,7 @@ impl Application for TerminalApp {
                 (cell.fg, cell.bg)
             };
             let dim = flags.intersects(Flags::DIM);
-            let fg = colors::resolve(fg_color, palette, dim);
+            let fg = colors::resolve(fg_color, overrides, dim, &cfg_palette);
 
             // Selection highlight span.
             if content.selection.is_some_and(|sel| sel.contains(cell.point)) {
@@ -569,7 +637,7 @@ impl Application for TerminalApp {
 
             // Background run (skip the default background: the plate shows through).
             let bg = (bg_color != AnsiColor::Named(NamedColor::Background))
-                .then(|| colors::resolve(bg_color, palette, false));
+                .then(|| colors::resolve(bg_color, overrides, false, &cfg_palette));
             match (&mut cur_bg, bg) {
                 (Some((r, _s, e, rgb)), Some(new)) if *r == row && *e == col && *rgb == new => {
                     *e = col + width_cells;
@@ -658,21 +726,24 @@ impl Application for TerminalApp {
         let cursor_shape = cursor.shape;
         let cursor_row = cursor.point.line.0 + display_offset;
         let cursor_col = cursor.point.column.0;
-        let cursor_rgb = colors::indexed(NamedColor::Cursor as usize, palette);
+        let cursor_rgb = colors::indexed(NamedColor::Cursor as usize, overrides, &cfg_palette);
         let mode = content.mode;
 
         for (row, start, end, rgb) in bg_runs {
             pc.quad(self.cell_rect(row, start, end - start), quad_color(rgb, 1.0));
         }
         for (row, start, end) in sel_runs {
-            pc.quad(self.cell_rect(row, start, end - start), quad_color(SELECTION_RGB, 0.28));
+            pc.quad(
+                self.cell_rect(row, start, end - start),
+                quad_color(cfg_palette.selection, 0.28),
+            );
         }
         for run in text_runs {
             pc.text_attrs(
                 run.text,
-                pad + run.col as f32 * CELL_W,
-                pad + run.row as f32 * LINE_H,
-                FONT_SIZE,
+                pad + run.col as f32 * self.settings.cell_w,
+                pad + run.row as f32 * self.settings.line_h,
+                self.settings.font_size,
                 [run.fg.r, run.fg.g, run.fg.b],
                 Some(font.clone()),
                 Some(bounds),
@@ -681,7 +752,11 @@ impl Application for TerminalApp {
         }
         for (row, start, end, rgb, is_strike) in deco_runs {
             let mut rect = self.cell_rect(row, start, end - start);
-            rect.y += if is_strike { LINE_H * 0.55 } else { LINE_H - 2.0 };
+            rect.y += if is_strike {
+                self.settings.line_h * 0.55
+            } else {
+                self.settings.line_h - 2.0
+            };
             rect.height = 1.0;
             pc.quad(rect, quad_color(rgb, 1.0));
         }
@@ -712,7 +787,7 @@ impl Application for TerminalApp {
                     }
                     CursorShape::Underline => {
                         pc.quad(
-                            Rect { y: rect.y + LINE_H - 2.0, height: 2.0, ..rect },
+                            Rect { y: rect.y + self.settings.line_h - 2.0, height: 2.0, ..rect },
                             quad_color(cursor_rgb, 0.9),
                         );
                     }
