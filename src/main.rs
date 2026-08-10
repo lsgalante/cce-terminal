@@ -14,9 +14,14 @@
 //! pastes PRIMARY; Ctrl+Shift+C / Ctrl+Shift+V are the regular clipboard,
 //! with bracketed paste when the app enables it. OSC 52 stores are honored.
 //!
-//! Not yet: mouse reporting, alt-as-ESC (cce-ui's `KeyEvent` carries no alt
-//! modifier), measured cell metrics (0.60 em / 1.2 em estimates — exact for
-//! Berkeley Mono in practice).
+//! Mouse reporting: TUIs that enable a mouse mode (1000/1002/1003, with SGR
+//! 1006 / UTF-8 1005 / legacy encodings) get button, drag-motion, and wheel
+//! reports at cell coordinates, plus focus in/out (1004); holding Shift
+//! bypasses reporting so selection stays reachable, per convention.
+//!
+//! Not yet: alt-as-ESC (cce-ui's `KeyEvent` carries no alt modifier),
+//! measured cell metrics (0.60 em / 1.2 em estimates — exact for Berkeley
+//! Mono in practice).
 
 mod clip;
 mod colors;
@@ -113,6 +118,14 @@ struct TerminalApp {
     click_count: u8,
     /// Current window size (for selection edge-autoscroll bounds).
     win_h: f32,
+    /// Modifier state tracked from key events (mouse handlers receive no
+    /// modifiers). Shift bypasses mouse reporting; ctrl rides report codes.
+    shift_down: bool,
+    ctrl_down: bool,
+    /// Held buttons for drag-motion reports: bit 0 left, 1 middle, 2 right.
+    mouse_buttons: u8,
+    /// Cell of the last motion report — motion is per-cell, not per-pixel.
+    last_mouse_cell: Option<(usize, usize)>,
 }
 
 impl TerminalApp {
@@ -135,17 +148,46 @@ impl TerminalApp {
         }
     }
 
+    /// Pixel position → 0-based viewport cell (clamped).
+    fn viewport_cell(&self, pos: LogicalPosition) -> (usize, usize) {
+        let col = (((pos.x as f32 - self.pad) / CELL_W).max(0.0) as usize)
+            .min(self.cols as usize - 1);
+        let row = (((pos.y as f32 - self.pad) / LINE_H).max(0.0) as usize)
+            .min(self.rows as usize - 1);
+        (col, row)
+    }
+
     /// Pixel position → grid point (viewport-clamped; grid-space line, so
     /// scrolled history resolves to negative lines) plus which half of the
     /// cell was hit.
     fn grid_point(&self, pos: LogicalPosition) -> (Point, Side) {
+        let (col, row) = self.viewport_cell(pos);
         let col_f = ((pos.x as f32 - self.pad) / CELL_W).max(0.0);
-        let col = (col_f as usize).min(self.cols as usize - 1);
-        let row_f = ((pos.y as f32 - self.pad) / LINE_H).max(0.0);
-        let row = (row_f as usize).min(self.rows as usize - 1);
         let line = Line(row as i32 - self.term.grid().display_offset() as i32);
         let side = if col_f.fract() > 0.5 { Side::Right } else { Side::Left };
         (Point::new(line, Column(col)), side)
+    }
+
+    /// Whether pointer events currently belong to the application rather than
+    /// the selection machinery (Shift bypasses, per convention).
+    fn mouse_reporting(&self) -> bool {
+        self.term.mode().intersects(TermMode::MOUSE_MODE) && !self.shift_down
+    }
+
+    /// Modifier bits added to every report's button code. No alt: cce-ui's
+    /// `KeyEvent` doesn't carry it; shift never arrives here (it bypasses).
+    fn report_mods(&self) -> u8 {
+        if self.ctrl_down {
+            16
+        } else {
+            0
+        }
+    }
+
+    fn send_mouse_report(&mut self, code: u8, pressed: bool, col: usize, row: usize) {
+        if let Some(bytes) = mouse_report_bytes(*self.term.mode(), code, pressed, col, row) {
+            self.write_pty(&bytes);
+        }
     }
 
     /// Send pasted text to the pty and snap the view to the bottom.
@@ -157,6 +199,40 @@ impl TerminalApp {
             self.term.scroll_display(Scroll::Bottom);
         }
     }
+}
+
+/// Encode one mouse report. `code` is the xterm button code with modifier
+/// bits already applied (0/1/2 buttons, 64/65 wheel, +32 for motion);
+/// `col`/`row` are 0-based viewport cells. Picks the encoding the app
+/// negotiated: SGR (1006) > UTF-8 extended coords (1005) > legacy X10 bytes
+/// (coordinates saturate at their encodable maximum).
+fn mouse_report_bytes(
+    mode: TermMode,
+    code: u8,
+    pressed: bool,
+    col: usize,
+    row: usize,
+) -> Option<Vec<u8>> {
+    if mode.contains(TermMode::SGR_MOUSE) {
+        let suffix = if pressed { 'M' } else { 'm' };
+        return Some(format!("\x1b[<{};{};{}{}", code, col + 1, row + 1, suffix).into_bytes());
+    }
+    // Non-SGR encodings can't distinguish which button released.
+    let byte = 32 + if pressed { code } else { 3 | (code & !0b11) };
+    let mut bytes = vec![0x1b, b'[', b'M', byte];
+    if mode.contains(TermMode::UTF8_MOUSE) {
+        for coord in [col, row] {
+            let n = (coord + 1 + 32).min(2015) as u32;
+            let mut buf = [0u8; 4];
+            bytes.extend_from_slice(
+                char::from_u32(n).unwrap_or(' ').encode_utf8(&mut buf).as_bytes(),
+            );
+        }
+    } else {
+        bytes.push((col + 1 + 32).min(255) as u8);
+        bytes.push((row + 1 + 32).min(255) as u8);
+    }
+    Some(bytes)
 }
 
 /// Paste encoding: bracketed when the app asked for it (end-marker
@@ -342,6 +418,10 @@ impl Application for TerminalApp {
             last_click: None,
             click_count: 0,
             win_h: INIT_H as f32,
+            shift_down: false,
+            ctrl_down: false,
+            mouse_buttons: 0,
+            last_mouse_cell: None,
         }
     }
 
@@ -661,12 +741,35 @@ impl Application for TerminalApp {
         if self.focused != focused {
             self.focused = focused;
             *needs_rebuild = true;
+            // Modifier releases are lost while unfocused — start clean.
+            self.shift_down = false;
+            self.ctrl_down = false;
+            self.mouse_buttons = 0;
+            if self.term.mode().contains(TermMode::FOCUS_IN_OUT) {
+                self.write_pty(if focused { b"\x1b[I" } else { b"\x1b[O" });
+            }
         }
     }
 
     fn handle_pointer_move(&mut self, pos: LogicalPosition, needs_rebuild: &mut bool) {
         if std::env::var_os("CCE_TERM_DEBUG").is_some() {
             eprintln!("[input] move ({:.1},{:.1}) selecting={}", pos.x, pos.y, self.selecting);
+        }
+        if self.mouse_reporting() && !self.selecting {
+            let mode = *self.term.mode();
+            let motion_wanted = mode.contains(TermMode::MOUSE_MOTION)
+                || (mode.contains(TermMode::MOUSE_DRAG) && self.mouse_buttons != 0);
+            if motion_wanted {
+                let cell = self.viewport_cell(pos);
+                if self.last_mouse_cell != Some(cell) {
+                    self.last_mouse_cell = Some(cell);
+                    // Lowest held button, or 3 (no button) for plain motion.
+                    let button = (0..3).find(|b| self.mouse_buttons & (1 << b) != 0).unwrap_or(3);
+                    let code = 32 + button + self.report_mods();
+                    self.send_mouse_report(code, true, cell.0, cell.1);
+                }
+            }
+            return;
         }
         if !self.selecting {
             return;
@@ -694,14 +797,43 @@ impl Application for TerminalApp {
     ) -> Option<Self::Message> {
         if std::env::var_os("CCE_TERM_DEBUG").is_some() {
             eprintln!(
-                "[input] {:?} {:?} ({:.1},{:.1}) sel={}",
+                "[input] {:?} {:?} ({:.1},{:.1}) sel={} mode={:?} shift={}",
                 button,
                 state,
                 pos.x,
                 pos.y,
-                self.term.selection.is_some()
+                self.term.selection.is_some(),
+                self.term.mode(),
+                self.shift_down
             );
         }
+        let button_bit = match button {
+            MouseButton::Left => Some(0u8),
+            MouseButton::Middle => Some(1),
+            MouseButton::Right => Some(2),
+            _ => None,
+        };
+        if let Some(bit) = button_bit {
+            match state {
+                ElementState::Pressed => self.mouse_buttons |= 1 << bit,
+                ElementState::Released => self.mouse_buttons &= !(1 << bit),
+            }
+        }
+
+        // Application-owned pointer: report and stop — no selection, no
+        // middle-paste (Shift bypasses via mouse_reporting).
+        if self.mouse_reporting() && !self.selecting {
+            if let Some(code) = button_bit {
+                let (col, row) = self.viewport_cell(pos);
+                let code = code + self.report_mods();
+                self.send_mouse_report(code, state == ElementState::Pressed, col, row);
+                if state == ElementState::Pressed {
+                    self.last_mouse_cell = Some((col, row));
+                }
+            }
+            return None;
+        }
+
         match (button, state) {
             (MouseButton::Left, ElementState::Pressed) => {
                 let (point, side) = self.grid_point(pos);
@@ -751,7 +883,7 @@ impl Application for TerminalApp {
     fn handle_mouse_wheel(
         &mut self,
         delta: &MouseScrollDelta,
-        _pos: LogicalPosition,
+        pos: LogicalPosition,
         needs_rebuild: &mut bool,
     ) {
         self.scroll_accum += delta.notches_y() * SCROLL_LINES_PER_NOTCH;
@@ -760,6 +892,16 @@ impl Application for TerminalApp {
             return;
         }
         self.scroll_accum -= lines as f32;
+
+        // Wheel reports take precedence over alternate-scroll arrows.
+        if self.mouse_reporting() {
+            let (col, row) = self.viewport_cell(pos);
+            let code = if lines > 0 { 64 } else { 65 } + self.report_mods();
+            for _ in 0..lines.unsigned_abs() {
+                self.send_mouse_report(code, true, col, row);
+            }
+            return;
+        }
 
         let mode = *self.term.mode();
         if mode.contains(TermMode::ALT_SCREEN) && mode.contains(TermMode::ALTERNATE_SCROLL) {
@@ -774,6 +916,15 @@ impl Application for TerminalApp {
     }
 
     fn handle_key_input(&mut self, event: &KeyEvent, needs_rebuild: &mut bool) -> Option<Self::Message> {
+        // Modifier state for mouse reporting (both edges, ahead of the
+        // pressed-only gate).
+        match &event.logical_key {
+            Key::Named(NamedKey::Shift) => self.shift_down = event.state == ElementState::Pressed,
+            Key::Named(NamedKey::Control) => {
+                self.ctrl_down = event.state == ElementState::Pressed
+            }
+            _ => {}
+        }
         if event.state != ElementState::Pressed {
             return None;
         }
@@ -899,6 +1050,38 @@ mod tests {
         sel.update(Point::new(Line(0), Column(4)), Side::Right);
         term.selection = Some(sel);
         assert_eq!(term.selection_to_string().as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn mouse_report_encodings() {
+        let sgr = TermMode::MOUSE_REPORT_CLICK | TermMode::SGR_MOUSE;
+        // SGR: press 'M', release 'm', same button code, 1-based coords.
+        assert_eq!(mouse_report_bytes(sgr, 0, true, 4, 2).unwrap(), b"\x1b[<0;5;3M");
+        assert_eq!(mouse_report_bytes(sgr, 2, false, 0, 0).unwrap(), b"\x1b[<2;1;1m");
+        // Legacy: +32 bytes, release collapses the button to 3.
+        let legacy = TermMode::MOUSE_REPORT_CLICK;
+        assert_eq!(
+            mouse_report_bytes(legacy, 0, true, 4, 2).unwrap(),
+            vec![0x1b, b'[', b'M', 32, 37, 35]
+        );
+        assert_eq!(
+            mouse_report_bytes(legacy, 0, false, 4, 2).unwrap(),
+            vec![0x1b, b'[', b'M', 35, 37, 35]
+        );
+        // Legacy coordinate saturation at byte 255.
+        assert_eq!(mouse_report_bytes(legacy, 0, true, 300, 2).unwrap()[4], 255);
+        // UTF-8 extended coords: col 200 → 233 → two-byte UTF-8.
+        let utf8 = TermMode::MOUSE_REPORT_CLICK | TermMode::UTF8_MOUSE;
+        let bytes = mouse_report_bytes(utf8, 0, true, 199, 0).unwrap();
+        assert_eq!(&bytes[4..], "\u{e8}\u{21}".to_string().as_bytes());
+    }
+
+    #[test]
+    fn mouse_modes_land_from_escapes() {
+        let term = term_with(b"\x1b[?1002h\x1b[?1006h");
+        assert!(term.mode().contains(TermMode::MOUSE_DRAG));
+        assert!(term.mode().contains(TermMode::SGR_MOUSE));
+        assert!(term.mode().intersects(TermMode::MOUSE_MODE));
     }
 
     #[test]
