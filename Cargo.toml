@@ -1,0 +1,10 @@
+[package]
+name = "cce-terminal"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+cce-ui = { path = "../cce-ui" }
+wayland-client = { version = "0.31", features = ["system"] }
+calloop = "0.13.0"
+libc = "0.2"
