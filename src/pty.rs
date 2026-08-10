@@ -12,11 +12,11 @@ pub struct Pty {
     pub child: Child,
 }
 
-/// Open a pty pair and spawn `$SHELL` on the slave side, in its own session
-/// with the slave as controlling terminal. The slave fd is fully handed to the
-/// child (stdin/stdout/stderr) and closed in the parent, so EOF on the master
-/// is the child-exit signal.
-pub fn spawn_shell(cols: u16, rows: u16) -> io::Result<Pty> {
+/// Open a pty pair and spawn `command` (or `$SHELL`) on the slave side, in
+/// its own session with the slave as controlling terminal. The slave fd is
+/// fully handed to the child (stdin/stdout/stderr) and closed in the parent,
+/// so EOF on the master is the child-exit signal.
+pub fn spawn_shell(cols: u16, rows: u16, command: Option<&[String]>) -> io::Result<Pty> {
     let mut master: libc::c_int = -1;
     let mut slave: libc::c_int = -1;
     let ws = libc::winsize { ws_row: rows, ws_col: cols, ws_xpixel: 0, ws_ypixel: 0 };
@@ -30,12 +30,18 @@ pub fn spawn_shell(cols: u16, rows: u16) -> io::Result<Pty> {
     let slave = unsafe { OwnedFd::from_raw_fd(slave) };
     unsafe { libc::fcntl(master.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) };
 
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
-    let mut cmd = Command::new(&shell);
-    // TERM=dumb for the spike: the screen model only understands a VT subset,
-    // so keep prompts/tools from emitting full escape traffic. Switches to a
-    // real terminfo entry once a proper VT layer (alacritty_terminal) lands.
-    cmd.env("TERM", "dumb")
+    let mut cmd = match command {
+        Some(argv) => {
+            let mut c = Command::new(&argv[0]);
+            c.args(&argv[1..]);
+            c
+        }
+        None => Command::new(std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string())),
+    };
+    // The VT layer is alacritty_terminal, so alacritty's terminfo entry
+    // describes us accurately (verified present on the host).
+    cmd.env("TERM", "alacritty")
+        .env("COLORTERM", "truecolor")
         .stdin(Stdio::from(slave.try_clone()?))
         .stdout(Stdio::from(slave.try_clone()?))
         .stderr(Stdio::from(slave));
@@ -83,7 +89,7 @@ mod tests {
     /// window (the GUI path is `handle_key_input` → the same master fd).
     #[test]
     fn shell_round_trip() {
-        let mut pty = spawn_shell(80, 24).expect("openpty/spawn");
+        let mut pty = spawn_shell(80, 24, None).expect("openpty/spawn");
         let mut writer = pty.dup_handle().unwrap();
         let mut reader = pty.dup_handle().unwrap();
         writer.write_all(b"printf 'RT-%s\\n' OK; exit\r").unwrap();
