@@ -19,9 +19,8 @@
 //! reports at cell coordinates, plus focus in/out (1004); holding Shift
 //! bypasses reporting so selection stays reachable, per convention.
 //!
-//! Not yet: alt-as-ESC (cce-ui's `KeyEvent` carries no alt modifier),
-//! measured cell metrics (0.60 em / 1.2 em estimates — exact for Berkeley
-//! Mono in practice).
+//! Not yet: measured cell metrics (0.60 em / 1.2 em estimates — exact for
+//! Berkeley Mono in practice), KDL config for font size and palette.
 
 mod clip;
 mod colors;
@@ -119,9 +118,10 @@ struct TerminalApp {
     /// Current window size (for selection edge-autoscroll bounds).
     win_h: f32,
     /// Modifier state tracked from key events (mouse handlers receive no
-    /// modifiers). Shift bypasses mouse reporting; ctrl rides report codes.
+    /// modifiers). Shift bypasses mouse reporting; ctrl/alt ride report codes.
     shift_down: bool,
     ctrl_down: bool,
+    alt_down: bool,
     /// Held buttons for drag-motion reports: bit 0 left, 1 middle, 2 right.
     mouse_buttons: u8,
     /// Cell of the last motion report — motion is per-cell, not per-pixel.
@@ -174,14 +174,10 @@ impl TerminalApp {
         self.term.mode().intersects(TermMode::MOUSE_MODE) && !self.shift_down
     }
 
-    /// Modifier bits added to every report's button code. No alt: cce-ui's
-    /// `KeyEvent` doesn't carry it; shift never arrives here (it bypasses).
+    /// Modifier bits added to every report's button code. Shift never
+    /// arrives here (it bypasses reporting).
     fn report_mods(&self) -> u8 {
-        if self.ctrl_down {
-            16
-        } else {
-            0
-        }
+        (self.alt_down as u8) * 8 + (self.ctrl_down as u8) * 16
     }
 
     fn send_mouse_report(&mut self, code: u8, pressed: bool, col: usize, row: usize) {
@@ -261,82 +257,78 @@ fn quad_color(rgb: Rgb, alpha: f32) -> [f32; 4] {
 }
 
 /// Terminal byte encoding for a key press; `None` = nothing to send. Honors
-/// DECCKM (application cursor keys). No alt-as-ESC yet: `KeyEvent` carries no
-/// alt modifier.
+/// DECCKM (application cursor keys) and the xterm modifier parameter
+/// (`1 + shift + 2·alt + 4·ctrl`) on CSI keys; alt prefixes ESC everywhere
+/// else (readline's alt-b / alt-backspace family).
 fn encode_key(ev: &KeyEvent, mode: TermMode) -> Option<Vec<u8>> {
     let app = mode.contains(TermMode::APP_CURSOR);
+    let m = 1 + ev.shift as u8 + 2 * ev.alt as u8 + 4 * ev.ctrl as u8;
+
+    enum Enc {
+        /// `ESC[<final>` / `ESCO<final>` (app mode) / `ESC[1;<m><final>`.
+        Csi(char),
+        /// `ESC[<n>~` / `ESC[<n>;<m>~`.
+        Tilde(u8),
+        /// Raw bytes, ESC-prefixed when alt is held.
+        Plain(&'static [u8]),
+    }
+
     match &ev.logical_key {
         Key::Named(k) => {
-            let b: &[u8] = match k {
-                NamedKey::Enter => b"\r",
-                NamedKey::Backspace => b"\x7f",
-                NamedKey::Tab => b"\t",
-                NamedKey::Escape => b"\x1b",
-                NamedKey::Space => b" ",
-                NamedKey::ArrowUp => {
-                    if app {
-                        b"\x1bOA"
-                    } else {
-                        b"\x1b[A"
-                    }
-                }
-                NamedKey::ArrowDown => {
-                    if app {
-                        b"\x1bOB"
-                    } else {
-                        b"\x1b[B"
-                    }
-                }
-                NamedKey::ArrowRight => {
-                    if app {
-                        b"\x1bOC"
-                    } else {
-                        b"\x1b[C"
-                    }
-                }
-                NamedKey::ArrowLeft => {
-                    if app {
-                        b"\x1bOD"
-                    } else {
-                        b"\x1b[D"
-                    }
-                }
-                NamedKey::Home => {
-                    if app {
-                        b"\x1bOH"
-                    } else {
-                        b"\x1b[H"
-                    }
-                }
-                NamedKey::End => {
-                    if app {
-                        b"\x1bOF"
-                    } else {
-                        b"\x1b[F"
-                    }
-                }
-                NamedKey::PageUp => b"\x1b[5~",
-                NamedKey::PageDown => b"\x1b[6~",
-                NamedKey::Delete => b"\x1b[3~",
-                NamedKey::F5 => b"\x1b[15~",
+            let enc = match k {
+                NamedKey::ArrowUp => Enc::Csi('A'),
+                NamedKey::ArrowDown => Enc::Csi('B'),
+                NamedKey::ArrowRight => Enc::Csi('C'),
+                NamedKey::ArrowLeft => Enc::Csi('D'),
+                NamedKey::Home => Enc::Csi('H'),
+                NamedKey::End => Enc::Csi('F'),
+                NamedKey::PageUp => Enc::Tilde(5),
+                NamedKey::PageDown => Enc::Tilde(6),
+                NamedKey::Delete => Enc::Tilde(3),
+                NamedKey::F5 => Enc::Tilde(15),
+                NamedKey::Enter => Enc::Plain(b"\r"),
+                NamedKey::Backspace => Enc::Plain(b"\x7f"),
+                NamedKey::Tab if ev.shift => return Some(b"\x1b[Z".to_vec()),
+                NamedKey::Tab => Enc::Plain(b"\t"),
+                NamedKey::Escape => Enc::Plain(b"\x1b"),
+                NamedKey::Space if ev.ctrl => Enc::Plain(b"\x00"),
+                NamedKey::Space => Enc::Plain(b" "),
                 _ => return None,
             };
-            Some(b.to_vec())
+            Some(match enc {
+                Enc::Csi(c) if m > 1 => format!("\x1b[1;{m}{c}").into_bytes(),
+                Enc::Csi(c) if app => format!("\x1bO{c}").into_bytes(),
+                Enc::Csi(c) => format!("\x1b[{c}").into_bytes(),
+                Enc::Tilde(n) if m > 1 => format!("\x1b[{n};{m}~").into_bytes(),
+                Enc::Tilde(n) => format!("\x1b[{n}~").into_bytes(),
+                Enc::Plain(b) => {
+                    let mut bytes = Vec::with_capacity(b.len() + 1);
+                    if ev.alt {
+                        bytes.push(0x1b);
+                    }
+                    bytes.extend_from_slice(b);
+                    bytes
+                }
+            })
         }
         Key::Character(s) => {
-            if ev.ctrl {
+            let mut bytes: Vec<u8> = if ev.ctrl {
                 match s.chars().next()?.to_ascii_lowercase() {
-                    c @ 'a'..='z' => Some(vec![c as u8 - b'a' + 1]),
-                    '[' => Some(vec![0x1b]),
-                    '\\' => Some(vec![0x1c]),
-                    ']' => Some(vec![0x1d]),
-                    _ => None,
+                    c @ 'a'..='z' => vec![c as u8 - b'a' + 1],
+                    '[' => vec![0x1b],
+                    '\\' => vec![0x1c],
+                    ']' => vec![0x1d],
+                    _ => return None,
                 }
             } else if let Some(t) = &ev.text {
-                Some(t.as_bytes().to_vec())
+                t.as_bytes().to_vec()
             } else {
-                Some(s.as_bytes().to_vec())
+                s.as_bytes().to_vec()
+            };
+            if ev.alt {
+                bytes.insert(0, 0x1b);
             }
+            Some(bytes)
         }
     }
 }
@@ -420,6 +412,7 @@ impl Application for TerminalApp {
             win_h: INIT_H as f32,
             shift_down: false,
             ctrl_down: false,
+            alt_down: false,
             mouse_buttons: 0,
             last_mouse_cell: None,
         }
@@ -744,6 +737,7 @@ impl Application for TerminalApp {
             // Modifier releases are lost while unfocused — start clean.
             self.shift_down = false;
             self.ctrl_down = false;
+            self.alt_down = false;
             self.mouse_buttons = 0;
             if self.term.mode().contains(TermMode::FOCUS_IN_OUT) {
                 self.write_pty(if focused { b"\x1b[I" } else { b"\x1b[O" });
@@ -923,6 +917,7 @@ impl Application for TerminalApp {
             Key::Named(NamedKey::Control) => {
                 self.ctrl_down = event.state == ElementState::Pressed
             }
+            Key::Named(NamedKey::Alt) => self.alt_down = event.state == ElementState::Pressed,
             _ => {}
         }
         if event.state != ElementState::Pressed {
@@ -1012,18 +1007,51 @@ mod tests {
         assert_eq!(term.grid().cursor.point.line, Line(2));
     }
 
+    fn key(logical_key: Key, ctrl: bool, shift: bool, alt: bool) -> KeyEvent {
+        let text = match &logical_key {
+            Key::Character(s) if !ctrl && !alt => Some(s.clone()),
+            _ => None,
+        };
+        KeyEvent { state: ElementState::Pressed, logical_key, text, repeat: false, ctrl, shift, alt }
+    }
+
     #[test]
     fn app_cursor_mode_switches_arrow_encoding() {
-        let ev = KeyEvent {
-            state: ElementState::Pressed,
-            logical_key: Key::Named(NamedKey::ArrowUp),
-            text: None,
-            repeat: false,
-            ctrl: false,
-            shift: false,
-        };
+        let ev = key(Key::Named(NamedKey::ArrowUp), false, false, false);
         assert_eq!(encode_key(&ev, TermMode::empty()).unwrap(), b"\x1b[A");
         assert_eq!(encode_key(&ev, TermMode::APP_CURSOR).unwrap(), b"\x1bOA");
+    }
+
+    #[test]
+    fn modifier_parameters_on_csi_keys() {
+        let up = |c, s, a| key(Key::Named(NamedKey::ArrowUp), c, s, a);
+        // alt = +2, ctrl = +4, shift = +1 on the xterm modifier parameter.
+        assert_eq!(encode_key(&up(false, false, true), TermMode::empty()).unwrap(), b"\x1b[1;3A");
+        assert_eq!(encode_key(&up(true, false, false), TermMode::empty()).unwrap(), b"\x1b[1;5A");
+        assert_eq!(encode_key(&up(true, true, true), TermMode::empty()).unwrap(), b"\x1b[1;8A");
+        // Modified keys keep CSI form even in app-cursor mode.
+        assert_eq!(
+            encode_key(&up(true, false, false), TermMode::APP_CURSOR).unwrap(),
+            b"\x1b[1;5A"
+        );
+        // Tilde keys carry the parameter after their number.
+        let del = key(Key::Named(NamedKey::Delete), false, false, true);
+        assert_eq!(encode_key(&del, TermMode::empty()).unwrap(), b"\x1b[3;3~");
+    }
+
+    #[test]
+    fn alt_prefixes_esc() {
+        let b = key(Key::Character("b".into()), false, false, true);
+        assert_eq!(encode_key(&b, TermMode::empty()).unwrap(), b"\x1bb");
+        // ctrl+alt compose: ESC then the ctrl byte.
+        let w = key(Key::Character("w".into()), true, false, true);
+        assert_eq!(encode_key(&w, TermMode::empty()).unwrap(), vec![0x1b, 0x17]);
+        // alt+backspace: readline backward-kill-word.
+        let bs = key(Key::Named(NamedKey::Backspace), false, false, true);
+        assert_eq!(encode_key(&bs, TermMode::empty()).unwrap(), vec![0x1b, 0x7f]);
+        // shift+tab is backtab regardless of other state.
+        let tab = key(Key::Named(NamedKey::Tab), false, true, false);
+        assert_eq!(encode_key(&tab, TermMode::empty()).unwrap(), b"\x1b[Z");
     }
 
     #[test]
@@ -1095,15 +1123,9 @@ mod tests {
 
     #[test]
     fn ctrl_chars_encode() {
-        let ev = |c: &str, ctrl: bool| KeyEvent {
-            state: ElementState::Pressed,
-            logical_key: Key::Character(c.to_string()),
-            text: Some(c.to_string()),
-            repeat: false,
-            ctrl,
-            shift: false,
-        };
-        assert_eq!(encode_key(&ev("c", true), TermMode::empty()).unwrap(), vec![0x03]);
-        assert_eq!(encode_key(&ev("a", false), TermMode::empty()).unwrap(), b"a");
+        let c = key(Key::Character("c".into()), true, false, false);
+        assert_eq!(encode_key(&c, TermMode::empty()).unwrap(), vec![0x03]);
+        let a = key(Key::Character("a".into()), false, false, false);
+        assert_eq!(encode_key(&a, TermMode::empty()).unwrap(), b"a");
     }
 }
