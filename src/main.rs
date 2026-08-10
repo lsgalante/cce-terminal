@@ -9,19 +9,28 @@
 //! arrows on the alternate screen); OSC titles flow to the xdg toplevel via
 //! the engine's `settings().title` poll.
 //!
-//! Not yet: selection/clipboard, mouse reporting, alt-as-ESC (cce-ui's
-//! `KeyEvent` carries no alt modifier), measured cell metrics (0.60 em / 1.2 em
-//! estimates — exact for Berkeley Mono in practice).
+//! Selection follows the X/Wayland convention: click-drag (double = word,
+//! triple = line) highlights and copies to PRIMARY on release; middle-click
+//! pastes PRIMARY; Ctrl+Shift+C / Ctrl+Shift+V are the regular clipboard,
+//! with bracketed paste when the app enables it. OSC 52 stores are honored.
+//!
+//! Not yet: mouse reporting, alt-as-ESC (cce-ui's `KeyEvent` carries no alt
+//! modifier), measured cell metrics (0.60 em / 1.2 em estimates — exact for
+//! Berkeley Mono in practice).
 
+mod clip;
 mod colors;
 mod pty;
 
 use std::io::{Read, Write};
+use std::time::{Duration, Instant};
 
 use alacritty_terminal::event::{Event as TermEvent, EventListener, WindowSize};
 use alacritty_terminal::grid::{Dimensions, Scroll};
+use alacritty_terminal::index::{Column, Line, Point, Side};
+use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::term::cell::Flags;
-use alacritty_terminal::term::{Config as TermConfig, Term, TermMode};
+use alacritty_terminal::term::{ClipboardType, Config as TermConfig, Term, TermMode};
 use alacritty_terminal::vte::ansi::{
     Color as AnsiColor, CursorShape, NamedColor, Processor, Rgb,
 };
@@ -41,6 +50,11 @@ const INIT_H: u32 = 520;
 const SCROLLBACK: usize = 5000;
 /// Wheel notches → scrollback lines.
 const SCROLL_LINES_PER_NOTCH: f32 = 3.0;
+/// Presses in the same cell within this window escalate Simple → Semantic →
+/// Lines selection.
+const MULTI_CLICK_WINDOW: Duration = Duration::from_millis(400);
+/// Selection highlight, over cell backgrounds and under glyphs.
+const SELECTION_RGB: Rgb = Rgb { r: 0xc8, g: 0xd0, b: 0xe0 };
 
 #[derive(Clone)]
 enum Msg {
@@ -92,6 +106,13 @@ struct TerminalApp {
     /// Fractional wheel-scroll remainder (trackpad pixel deltas).
     scroll_accum: f32,
     focused: bool,
+    /// Left button held: pointer moves extend the selection.
+    selecting: bool,
+    /// Multi-click escalation state: last press instant + cell.
+    last_click: Option<(Instant, Point)>,
+    click_count: u8,
+    /// Current window size (for selection edge-autoscroll bounds).
+    win_h: f32,
 }
 
 impl TerminalApp {
@@ -112,6 +133,43 @@ impl TerminalApp {
             width: width_cells as f32 * CELL_W,
             height: LINE_H,
         }
+    }
+
+    /// Pixel position → grid point (viewport-clamped; grid-space line, so
+    /// scrolled history resolves to negative lines) plus which half of the
+    /// cell was hit.
+    fn grid_point(&self, pos: LogicalPosition) -> (Point, Side) {
+        let col_f = ((pos.x as f32 - self.pad) / CELL_W).max(0.0);
+        let col = (col_f as usize).min(self.cols as usize - 1);
+        let row_f = ((pos.y as f32 - self.pad) / LINE_H).max(0.0);
+        let row = (row_f as usize).min(self.rows as usize - 1);
+        let line = Line(row as i32 - self.term.grid().display_offset() as i32);
+        let side = if col_f.fract() > 0.5 { Side::Right } else { Side::Left };
+        (Point::new(line, Column(col)), side)
+    }
+
+    /// Send pasted text to the pty and snap the view to the bottom.
+    fn paste(&mut self, text: &str) {
+        let bracketed = self.term.mode().contains(TermMode::BRACKETED_PASTE);
+        let bytes = paste_bytes(text, bracketed);
+        self.write_pty(&bytes);
+        if self.term.grid().display_offset() != 0 {
+            self.term.scroll_display(Scroll::Bottom);
+        }
+    }
+}
+
+/// Paste encoding: bracketed when the app asked for it (end-marker
+/// occurrences stripped so a paste can't fake the terminator),
+/// newline-normalized to CR otherwise.
+fn paste_bytes(text: &str, bracketed: bool) -> Vec<u8> {
+    if bracketed {
+        let mut bytes = b"\x1b[200~".to_vec();
+        bytes.extend_from_slice(text.replace("\x1b[201~", "").as_bytes());
+        bytes.extend_from_slice(b"\x1b[201~");
+        bytes
+    } else {
+        text.replace("\r\n", "\r").replace('\n', "\r").into_bytes()
     }
 }
 
@@ -280,6 +338,10 @@ impl Application for TerminalApp {
             title: None,
             scroll_accum: 0.0,
             focused: true,
+            selecting: false,
+            last_click: None,
+            click_count: 0,
+            win_h: INIT_H as f32,
         }
     }
 
@@ -331,7 +393,23 @@ impl Application for TerminalApp {
                     });
                     self.write_pty(response.as_bytes());
                 }
-                // Selection/clipboard phase: ClipboardStore/ClipboardLoad.
+                // OSC 52: programs storing to (or, if enabled in the term
+                // config, reading from) the system clipboards.
+                TermEvent::ClipboardStore(ty, text) => match ty {
+                    ClipboardType::Clipboard => cce_ui::widget::clipboard::copy_to_clipboard(&text),
+                    ClipboardType::Selection => clip::copy_primary(&text),
+                },
+                TermEvent::ClipboardLoad(ty, format) => {
+                    let text = match ty {
+                        ClipboardType::Clipboard => {
+                            cce_ui::widget::clipboard::read_from_clipboard()
+                        }
+                        ClipboardType::Selection => clip::paste_primary(),
+                    }
+                    .unwrap_or_default();
+                    let response = format(&text);
+                    self.write_pty(response.as_bytes());
+                }
                 // Bell/Wakeup/cursor-blink: nothing to do yet.
                 _ => {}
             },
@@ -341,6 +419,7 @@ impl Application for TerminalApp {
     fn tick(&mut self, _dt: f32, _needs_rebuild: &mut bool) {}
 
     fn handle_resize(&mut self, width: f32, height: f32, _scale: f64) {
+        self.win_h = height;
         let (cols, rows) = self.grid_for(width, height);
         if (cols, rows) != (self.cols, self.rows) {
             self.cols = cols;
@@ -379,6 +458,8 @@ impl Application for TerminalApp {
         let mut text_runs: Vec<TextRun> = Vec::new();
         // (row, col_start, col_end, color, is_strikeout)
         let mut deco_runs: Vec<(usize, usize, usize, Rgb, bool)> = Vec::new();
+        // (row, col_start, col_end) — selection highlight spans.
+        let mut sel_runs: Vec<(usize, usize, usize)> = Vec::new();
         let mut cur_bg: Option<(usize, usize, usize, Rgb)> = None;
         let mut cur_text: Option<TextRun> = None;
 
@@ -404,6 +485,14 @@ impl Application for TerminalApp {
             };
             let dim = flags.intersects(Flags::DIM);
             let fg = colors::resolve(fg_color, palette, dim);
+
+            // Selection highlight span.
+            if content.selection.is_some_and(|sel| sel.contains(cell.point)) {
+                match sel_runs.last_mut() {
+                    Some((r, _s, e)) if *r == row && *e == col => *e = col + width_cells,
+                    _ => sel_runs.push((row, col, col + width_cells)),
+                }
+            }
 
             // Background run (skip the default background: the plate shows through).
             let bg = (bg_color != AnsiColor::Named(NamedColor::Background))
@@ -502,6 +591,9 @@ impl Application for TerminalApp {
         for (row, start, end, rgb) in bg_runs {
             pc.quad(self.cell_rect(row, start, end - start), quad_color(rgb, 1.0));
         }
+        for (row, start, end) in sel_runs {
+            pc.quad(self.cell_rect(row, start, end - start), quad_color(SELECTION_RGB, 0.28));
+        }
         for run in text_runs {
             pc.text_attrs(
                 run.text,
@@ -572,15 +664,87 @@ impl Application for TerminalApp {
         }
     }
 
-    fn handle_pointer_move(&mut self, _pos: LogicalPosition, _needs_rebuild: &mut bool) {}
+    fn handle_pointer_move(&mut self, pos: LogicalPosition, needs_rebuild: &mut bool) {
+        if std::env::var_os("CCE_TERM_DEBUG").is_some() {
+            eprintln!("[input] move ({:.1},{:.1}) selecting={}", pos.x, pos.y, self.selecting);
+        }
+        if !self.selecting {
+            return;
+        }
+        // Dragging past the frame edge nudges the scrollback along (one line
+        // per motion event — no autoscroll timer yet).
+        if (pos.y as f32) < self.pad {
+            self.term.scroll_display(Scroll::Delta(1));
+        } else if pos.y as f32 > self.win_h - self.pad {
+            self.term.scroll_display(Scroll::Delta(-1));
+        }
+        let (point, side) = self.grid_point(pos);
+        if let Some(selection) = &mut self.term.selection {
+            selection.update(point, side);
+            *needs_rebuild = true;
+        }
+    }
 
     fn handle_mouse_input(
         &mut self,
-        _button: MouseButton,
-        _state: ElementState,
-        _pos: LogicalPosition,
-        _needs_rebuild: &mut bool,
+        button: MouseButton,
+        state: ElementState,
+        pos: LogicalPosition,
+        needs_rebuild: &mut bool,
     ) -> Option<Self::Message> {
+        if std::env::var_os("CCE_TERM_DEBUG").is_some() {
+            eprintln!(
+                "[input] {:?} {:?} ({:.1},{:.1}) sel={}",
+                button,
+                state,
+                pos.x,
+                pos.y,
+                self.term.selection.is_some()
+            );
+        }
+        match (button, state) {
+            (MouseButton::Left, ElementState::Pressed) => {
+                let (point, side) = self.grid_point(pos);
+                let now = Instant::now();
+                let repeat = self
+                    .last_click
+                    .is_some_and(|(t, p)| now - t < MULTI_CLICK_WINDOW && p == point);
+                self.click_count = if repeat { self.click_count % 3 + 1 } else { 1 };
+                self.last_click = Some((now, point));
+                let ty = match self.click_count {
+                    2 => SelectionType::Semantic,
+                    3 => SelectionType::Lines,
+                    _ => SelectionType::Simple,
+                };
+                let had_selection = self.term.selection.is_some();
+                self.term.selection = Some(Selection::new(ty, point, side));
+                self.selecting = true;
+                // Semantic/Lines are non-empty immediately; a fresh Simple
+                // press only needs a repaint if it cleared an old highlight.
+                *needs_rebuild = had_selection || ty != SelectionType::Simple;
+            }
+            (MouseButton::Left, ElementState::Released) => {
+                self.selecting = false;
+                // Empty selections (a plain click) drop; real ones go to
+                // PRIMARY, per the select-then-middle-click convention.
+                match self.term.selection_to_string() {
+                    Some(text) if !text.is_empty() => clip::copy_primary(&text),
+                    _ => {
+                        if self.term.selection.take().is_some() {
+                            *needs_rebuild = true;
+                        }
+                    }
+                }
+            }
+            (MouseButton::Middle, ElementState::Pressed) => {
+                if let Some(text) = clip::paste_primary() {
+                    if !text.is_empty() {
+                        self.paste(&text);
+                    }
+                }
+            }
+            _ => {}
+        }
         None
     }
 
@@ -613,8 +777,38 @@ impl Application for TerminalApp {
         if event.state != ElementState::Pressed {
             return None;
         }
+
+        // Clipboard chords, ahead of terminal encoding (a bare Ctrl+C must
+        // still reach the shell as SIGINT).
+        if event.ctrl && event.shift {
+            if let Key::Character(s) = &event.logical_key {
+                match s.to_lowercase().as_str() {
+                    "c" => {
+                        if let Some(text) = self.term.selection_to_string() {
+                            if !text.is_empty() {
+                                cce_ui::widget::clipboard::copy_to_clipboard(&text);
+                            }
+                        }
+                        return None;
+                    }
+                    "v" => {
+                        if let Some(text) = cce_ui::widget::clipboard::read_from_clipboard() {
+                            if !text.is_empty() {
+                                self.paste(&text);
+                            }
+                        }
+                        return None;
+                    }
+                    _ => {}
+                }
+            }
+        }
+
         if let Some(bytes) = encode_key(event, *self.term.mode()) {
             self.write_pty(&bytes);
+            if self.term.selection.take().is_some() {
+                *needs_rebuild = true;
+            }
             if self.term.grid().display_offset() != 0 {
                 self.term.scroll_display(Scroll::Bottom);
                 *needs_rebuild = true;
@@ -679,6 +873,41 @@ mod tests {
         };
         assert_eq!(encode_key(&ev, TermMode::empty()).unwrap(), b"\x1b[A");
         assert_eq!(encode_key(&ev, TermMode::APP_CURSOR).unwrap(), b"\x1bOA");
+    }
+
+    #[test]
+    fn selection_extracts_text() {
+        let mut term = term_with(b"hello world\r\nsecond line");
+        // Word-select "world": semantic selection from a point inside it.
+        term.selection = Some(Selection::new(
+            SelectionType::Semantic,
+            Point::new(Line(0), Column(8)),
+            Side::Left,
+        ));
+        assert_eq!(term.selection_to_string().as_deref(), Some("world"));
+        // Line-select the second row.
+        term.selection = Some(Selection::new(
+            SelectionType::Lines,
+            Point::new(Line(1), Column(3)),
+            Side::Left,
+        ));
+        // Line selections carry their trailing newline.
+        assert_eq!(term.selection_to_string().as_deref(), Some("second line\n"));
+        // Simple drag across the first word.
+        let mut sel =
+            Selection::new(SelectionType::Simple, Point::new(Line(0), Column(0)), Side::Left);
+        sel.update(Point::new(Line(0), Column(4)), Side::Right);
+        term.selection = Some(sel);
+        assert_eq!(term.selection_to_string().as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn paste_encoding() {
+        assert_eq!(paste_bytes("a\nb\r\nc", false), b"a\rb\rc");
+        assert_eq!(
+            paste_bytes("hi\x1b[201~!", true),
+            b"\x1b[200~hi!\x1b[201~"
+        );
     }
 
     #[test]
