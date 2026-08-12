@@ -75,16 +75,71 @@ struct Settings {
 }
 
 impl Settings {
-    fn load() -> Self {
+    fn load(font_family: &str) -> Self {
         let font_size = cce_ui::config::get_f32("/terminal/font_size", 14.0).clamp(6.0, 72.0);
         let scrollback =
             cce_ui::config::get_i64("/terminal/scrollback", 5000).clamp(0, 200_000) as usize;
+        // Measure the real glyph advance; the 0.60 em toolkit estimate is the
+        // fallback (and the sanity band — a broken measurement won't wreck
+        // the grid).
+        let estimate = font_size * 0.60;
+        let cell_w = measure_advance(font_family, font_size)
+            .filter(|w| (0.5 * estimate..2.0 * estimate).contains(w))
+            .unwrap_or(estimate);
+        if std::env::var_os("CCE_TERM_DEBUG").is_some() {
+            eprintln!("[metrics] family={font_family} size={font_size} cell_w={cell_w} (estimate {estimate})");
+        }
         Settings {
             font_size,
             line_h: (font_size * 1.2).ceil(),
-            cell_w: font_size * 0.60,
+            cell_w,
             scrollback,
             palette: colors::Palette::from_config(),
+        }
+    }
+}
+
+/// Shape a long run of one ASCII glyph in the terminal font and divide out
+/// the per-cell advance. Uses an app-side bundled-fonts `FontSystem` (the
+/// documented pattern for measurement), cached across config reloads.
+fn measure_advance(font_family: &str, font_size: f32) -> Option<f32> {
+    use std::sync::{Mutex, OnceLock};
+    static FONT_SYSTEM: OnceLock<Mutex<glyphon::FontSystem>> = OnceLock::new();
+    const RUN: usize = 64;
+    let fs = FONT_SYSTEM.get_or_init(|| Mutex::new(cce_ui::create_font_system()));
+    let mut fs = fs.lock().ok()?;
+    let mut buffer = glyphon::Buffer::new(
+        &mut fs,
+        glyphon::Metrics::new(font_size, (font_size * 1.2).ceil()),
+    );
+    buffer.set_size(&mut fs, None, None);
+    buffer.set_text(
+        &mut fs,
+        &"M".repeat(RUN),
+        glyphon::Attrs::new().family(glyphon::Family::Name(font_family)),
+        glyphon::Shaping::Advanced,
+    );
+    let advance = buffer.layout_runs().next()?.line_w / RUN as f32;
+    (advance.is_finite() && advance > 0.0).then_some(advance)
+}
+
+/// The app's rebindable shortcuts, resolved once at startup from input.kdl
+/// (domain `cce-terminal`, falling back to `cce-ui` then these defaults).
+struct Keys {
+    copy: String,
+    paste: String,
+    scroll_up: String,
+    scroll_down: String,
+}
+
+impl Keys {
+    fn load() -> Self {
+        let get = cce_ui::input::app_chord;
+        Keys {
+            copy: get("copy", "ctrl+shift+c"),
+            paste: get("paste", "ctrl+shift+v"),
+            scroll_up: get("scroll_up", "shift+pageup"),
+            scroll_down: get("scroll_down", "shift+pagedown"),
         }
     }
 }
@@ -145,9 +200,16 @@ struct TerminalApp {
     last_click: Option<(Instant, Point)>,
     click_count: u8,
     settings: Settings,
+    keys: Keys,
     /// Config-file mtime at the last (re)load — tick polls it so palette and
     /// font-size edits apply live, per the DE's edit-the-file convention.
     config_stamp: Option<std::time::SystemTime>,
+    /// Bell flash intensity, 1.0 → 0 over ~a quarter second (decayed in tick).
+    bell: f32,
+    /// Last pointer position (any state) — tick's autoscroll reads it while a
+    /// selection drag holds the pointer in the frame's edge padding.
+    last_pointer: LogicalPosition,
+    autoscroll_accum: f32,
     /// Current window size (for grid re-derivation on config reload and
     /// selection edge-autoscroll bounds).
     win_w: f32,
@@ -392,7 +454,10 @@ impl Application for TerminalApp {
         sender: calloop::channel::Sender<Self::Message>,
     ) -> Self {
         let pad = cce_ui::layout::backplate_padding();
-        let settings = Settings::load();
+        // Index 6 of the preferred-fonts tuple is the `terminal` alias
+        // (~/.config/fontconfig/fonts.conf), falling back to Noto Sans Mono.
+        let font = cce_ui::layout::read_preferred_fonts().6;
+        let settings = Settings::load(&font);
         let config_stamp = cce_ui::config::config_files_modified();
         let (cols, rows) = grid_dims(INIT_W as f32, INIT_H as f32, pad, &settings);
 
@@ -431,10 +496,6 @@ impl Application for TerminalApp {
             TermConfig { scrolling_history: settings.scrollback, ..TermConfig::default() };
         let term = Term::new(config, &TermDims { cols, rows }, EventProxy(sender));
 
-        // Index 6 of the preferred-fonts tuple is the `terminal` alias
-        // (~/.config/fontconfig/fonts.conf), falling back to Noto Sans Mono.
-        let font = cce_ui::layout::read_preferred_fonts().6;
-
         TerminalApp {
             term,
             parser: Processor::new(),
@@ -451,7 +512,11 @@ impl Application for TerminalApp {
             last_click: None,
             click_count: 0,
             settings,
+            keys: Keys::load(),
             config_stamp,
+            bell: 0.0,
+            last_pointer: LogicalPosition::new(0.0, 0.0),
+            autoscroll_accum: 0.0,
             win_w: INIT_W as f32,
             win_h: INIT_H as f32,
             shift_down: false,
@@ -527,23 +592,64 @@ impl Application for TerminalApp {
                     let response = format(&text);
                     self.write_pty(response.as_bytes());
                 }
-                // Bell/Wakeup/cursor-blink: nothing to do yet.
+                TermEvent::Bell => {
+                    self.bell = 1.0;
+                    *needs_rebuild = true;
+                }
+                // Wakeup/cursor-blink: nothing to do.
                 _ => {}
             },
         }
     }
 
-    /// Config edits apply live: poll the config files' mtime (the toolkit's
-    /// own getters stat them on every call anyway) and re-derive settings,
-    /// grid, and pty size on change. Scrollback capacity is the exception —
-    /// it's baked into the Term at startup.
-    fn tick(&mut self, _dt: f32, needs_rebuild: &mut bool) {
+    fn tick(&mut self, dt: f32, needs_rebuild: &mut bool) {
+        // Bell flash decay.
+        if self.bell > 0.0 {
+            self.bell = (self.bell - dt * 4.0).max(0.0);
+            *needs_rebuild = true;
+        }
+
+        // Selection autoscroll: while a drag holds the pointer in the top or
+        // bottom edge padding, scroll at a rate scaling with the overshoot
+        // (motion events stop at the edge, so this is time-driven).
+        if self.selecting {
+            let y = self.last_pointer.y as f32;
+            let overshoot = if y < self.pad {
+                self.pad - y
+            } else if y > self.win_h - self.pad {
+                (self.win_h - self.pad) - y
+            } else {
+                0.0
+            };
+            if overshoot != 0.0 {
+                let rate = 4.0 + overshoot.abs().min(24.0) * 2.0; // lines/sec
+                self.autoscroll_accum += dt * rate * overshoot.signum();
+                let lines = self.autoscroll_accum as i32;
+                if lines != 0 {
+                    self.autoscroll_accum -= lines as f32;
+                    self.term.scroll_display(Scroll::Delta(lines));
+                    let (point, side) = self.grid_point(self.last_pointer);
+                    if let Some(selection) = &mut self.term.selection {
+                        selection.update(point, side);
+                    }
+                    *needs_rebuild = true;
+                }
+            } else {
+                self.autoscroll_accum = 0.0;
+            }
+        }
+
+        // Config edits apply live: poll the config files' mtime (the
+        // toolkit's own getters stat them on every call anyway) and re-derive
+        // settings, grid, and pty size on change. Scrollback capacity is the
+        // exception — it's baked into the Term at startup.
         let stamp = cce_ui::config::config_files_modified();
         if stamp == self.config_stamp {
             return;
         }
         self.config_stamp = stamp;
-        let reloaded = Settings::load();
+        let font = self.font.clone();
+        let reloaded = Settings::load(&font);
         let old = std::mem::replace(&mut self.settings, reloaded);
         if reloaded != old {
             *needs_rebuild = true;
@@ -798,6 +904,11 @@ impl Application for TerminalApp {
             }
         }
 
+        // Visual bell: a brief foreground-tinted wash over the frame.
+        if self.bell > 0.0 {
+            pc.quad(frame, quad_color(cfg_palette.foreground, 0.12 * self.bell));
+        }
+
         Some(pc.finish())
     }
 
@@ -824,6 +935,7 @@ impl Application for TerminalApp {
         if std::env::var_os("CCE_TERM_DEBUG").is_some() {
             eprintln!("[input] move ({:.1},{:.1}) selecting={}", pos.x, pos.y, self.selecting);
         }
+        self.last_pointer = pos;
         if self.mouse_reporting() && !self.selecting {
             let mode = *self.term.mode();
             let motion_wanted = mode.contains(TermMode::MOUSE_MOTION)
@@ -843,13 +955,7 @@ impl Application for TerminalApp {
         if !self.selecting {
             return;
         }
-        // Dragging past the frame edge nudges the scrollback along (one line
-        // per motion event — no autoscroll timer yet).
-        if (pos.y as f32) < self.pad {
-            self.term.scroll_display(Scroll::Delta(1));
-        } else if pos.y as f32 > self.win_h - self.pad {
-            self.term.scroll_display(Scroll::Delta(-1));
-        }
+        // Edge overshoot scrolls on tick's autoscroll clock, not per event.
         let (point, side) = self.grid_point(pos);
         if let Some(selection) = &mut self.term.selection {
             selection.update(point, side);
@@ -999,30 +1105,34 @@ impl Application for TerminalApp {
             return None;
         }
 
-        // Clipboard chords, ahead of terminal encoding (a bare Ctrl+C must
-        // still reach the shell as SIGINT).
-        if event.ctrl && event.shift {
-            if let Key::Character(s) = &event.logical_key {
-                match s.to_lowercase().as_str() {
-                    "c" => {
-                        if let Some(text) = self.term.selection_to_string() {
-                            if !text.is_empty() {
-                                cce_ui::widget::clipboard::copy_to_clipboard(&text);
-                            }
-                        }
-                        return None;
-                    }
-                    "v" => {
-                        if let Some(text) = cce_ui::widget::clipboard::read_from_clipboard() {
-                            if !text.is_empty() {
-                                self.paste(&text);
-                            }
-                        }
-                        return None;
-                    }
-                    _ => {}
+        // App shortcuts (input.kdl-rebindable), ahead of terminal encoding —
+        // a bare Ctrl+C must still reach the shell as SIGINT.
+        use cce_ui::widget::match_key_shortcut;
+        if match_key_shortcut(event, &self.keys.copy) {
+            if let Some(text) = self.term.selection_to_string() {
+                if !text.is_empty() {
+                    cce_ui::widget::clipboard::copy_to_clipboard(&text);
                 }
             }
+            return None;
+        }
+        if match_key_shortcut(event, &self.keys.paste) {
+            if let Some(text) = cce_ui::widget::clipboard::read_from_clipboard() {
+                if !text.is_empty() {
+                    self.paste(&text);
+                }
+            }
+            return None;
+        }
+        if match_key_shortcut(event, &self.keys.scroll_up) {
+            self.term.scroll_display(Scroll::PageUp);
+            *needs_rebuild = true;
+            return None;
+        }
+        if match_key_shortcut(event, &self.keys.scroll_down) {
+            self.term.scroll_display(Scroll::PageDown);
+            *needs_rebuild = true;
+            return None;
         }
 
         if let Some(bytes) = encode_key(event, *self.term.mode()) {
@@ -1194,6 +1304,26 @@ mod tests {
             paste_bytes("hi\x1b[201~!", true),
             b"\x1b[200~hi!\x1b[201~"
         );
+    }
+
+    #[test]
+    fn measured_advance_is_sane() {
+        // Depends on the bundled fonts being present ($CCE_FONTS_DIR /
+        // ~/Dropbox/Fonts); when they are, the measured advance must sit in
+        // the mono band around the 0.60 em estimate.
+        if let Some(adv) = measure_advance("Berkeley Mono", 14.0) {
+            assert!((5.0..=14.0).contains(&adv), "advance {adv} out of band");
+        }
+    }
+
+    #[test]
+    fn shortcut_matching_honors_alt() {
+        let ev = key(Key::Character("c".into()), true, true, false);
+        assert!(cce_ui::widget::match_key_shortcut(&ev, "ctrl+shift+c"));
+        assert!(!cce_ui::widget::match_key_shortcut(&ev, "ctrl+alt+c"));
+        let alt_ev = key(Key::Character("c".into()), false, false, true);
+        assert!(cce_ui::widget::match_key_shortcut(&alt_ev, "alt+c"));
+        assert!(!cce_ui::widget::match_key_shortcut(&alt_ev, "c"));
     }
 
     #[test]
