@@ -1154,7 +1154,14 @@ impl Application for TerminalApp {
 }
 
 fn main() {
+    // cce-ui logs its own fatal paths (Wayland dispatch / protocol errors that
+    // end the event loop) through `log`, which is a no-op sink unless the app
+    // installs a logger — without this, an app that dies with its compositor
+    // connection leaves no explanation behind.
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    log::info!("cce-terminal starting (pid {})", std::process::id());
     cce_ui::engine::run::<TerminalApp>();
+    log::info!("cce-terminal event loop returned; exiting");
 }
 
 #[cfg(test)]
