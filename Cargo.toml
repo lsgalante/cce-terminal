@@ -9,6 +9,5 @@ wayland-client = { version = "0.31", features = ["system"] }
 calloop = "0.13.0"
 libc = "0.2"
 alacritty_terminal = "0.26.0"
-glyphon = "0.8"
 log = "0.4"
 env_logger = "0.11"

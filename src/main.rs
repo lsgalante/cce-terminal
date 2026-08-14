@@ -104,20 +104,20 @@ impl Settings {
 /// documented pattern for measurement), cached across config reloads.
 fn measure_advance(font_family: &str, font_size: f32) -> Option<f32> {
     use std::sync::{Mutex, OnceLock};
-    static FONT_SYSTEM: OnceLock<Mutex<glyphon::FontSystem>> = OnceLock::new();
+    static FONT_SYSTEM: OnceLock<Mutex<cce_ui::cosmic_text::FontSystem>> = OnceLock::new();
     const RUN: usize = 64;
     let fs = FONT_SYSTEM.get_or_init(|| Mutex::new(cce_ui::create_font_system()));
     let mut fs = fs.lock().ok()?;
-    let mut buffer = glyphon::Buffer::new(
+    let mut buffer = cce_ui::cosmic_text::Buffer::new(
         &mut fs,
-        glyphon::Metrics::new(font_size, (font_size * 1.2).ceil()),
+        cce_ui::cosmic_text::Metrics::new(font_size, (font_size * 1.2).ceil()),
     );
     buffer.set_size(&mut fs, None, None);
     buffer.set_text(
         &mut fs,
         &"M".repeat(RUN),
-        glyphon::Attrs::new().family(glyphon::Family::Name(font_family)),
-        glyphon::Shaping::Advanced,
+        cce_ui::cosmic_text::Attrs::new().family(cce_ui::cosmic_text::Family::Name(font_family)),
+        cce_ui::cosmic_text::Shaping::Advanced,
     );
     let advance = buffer.layout_runs().next()?.line_w / RUN as f32;
     (advance.is_finite() && advance > 0.0).then_some(advance)
