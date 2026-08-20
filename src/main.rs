@@ -461,13 +461,16 @@ impl Application for TerminalApp {
         let config_stamp = cce_ui::config::config_files_modified();
         let (cols, rows) = grid_dims(INIT_W as f32, INIT_H as f32, pad, &settings);
 
-        // `cce-terminal -e <cmd> [args…]` runs a command instead of $SHELL.
-        let args: Vec<String> = std::env::args().collect();
-        let command: Option<Vec<String>> = args
-            .iter()
-            .position(|a| a == "-e")
-            .map(|i| args[i + 1..].to_vec())
-            .filter(|c| !c.is_empty());
+        // A command instead of $SHELL: `cce-terminal -e <cmd> [args…]`
+        // (xterm-style), or bare trailing args (foot-style) — the launcher
+        // hosts `Terminal=true` entries positionally (`term sh -c …`), so
+        // both conventions must work.
+        let argv: Vec<String> = std::env::args().skip(1).collect();
+        let command: Option<Vec<String>> = match argv.first().map(String::as_str) {
+            Some("-e") => Some(argv[1..].to_vec()).filter(|c| !c.is_empty()),
+            Some(_) => Some(argv.clone()),
+            None => None,
+        };
 
         let pty = pty::spawn_shell(cols, rows, command.as_deref())
             .expect("cce-terminal: failed to spawn shell on pty");

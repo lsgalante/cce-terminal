@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Terminal
+Comment=Terminal emulator
+Exec=cce-terminal
+Icon=cce-terminal
+Categories=System;TerminalEmulator;
+Terminal=false
+StartupNotify=false
+StartupWMClass=cce-terminal
