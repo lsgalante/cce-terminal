@@ -24,8 +24,8 @@
 //! `~/.config/cce/cce-terminal/config.kdl` (app file wins) with `font_size`,
 //! `scrollback`, and a `colors { … }` block naming `foreground`, `background`,
 //! `cursor`, `selection`, and the 16 ANSI slots (`black` … `bright_white`)
-//! as hex strings. The font family comes from fontconfig's `terminal` alias,
-//! like the rest of the DE's font routing.
+//! as hex strings. The font family comes from the shared config's
+//! `fonts { terminal }` key, like the rest of the DE's font routing.
 //!
 //! Not yet: measured cell metrics (0.60 em / 1.2 em estimates — exact for
 //! Berkeley Mono in practice).
@@ -454,9 +454,10 @@ impl Application for TerminalApp {
         sender: calloop::channel::Sender<Self::Message>,
     ) -> Self {
         let pad = cce_ui::layout::backplate_padding();
-        // Index 6 of the preferred-fonts tuple is the `terminal` alias
-        // (~/.config/fontconfig/fonts.conf), falling back to Noto Sans Mono.
-        let font = cce_ui::layout::read_preferred_fonts().6;
+        // `.3` is the `fonts { terminal }` family (this was the 7-tuple's
+        // fontconfig `terminal` alias before the DE's fonts moved into the
+        // shared KDL config), falling back to Noto Sans Mono.
+        let font = cce_ui::layout::read_preferred_fonts().3;
         let settings = Settings::load(&font);
         let config_stamp = cce_ui::config::config_files_modified();
         let (cols, rows) = grid_dims(INIT_W as f32, INIT_H as f32, pad, &settings);
