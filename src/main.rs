@@ -688,9 +688,15 @@ impl Application for TerminalApp {
         if plate[3] > 0.001 {
             plate[3] = cce_ui::color::root_plate_opacity();
         }
-        let radius = cce_ui::colors::root_plate_corner_radius();
+        // PlateSpec (cce-ui RFC 7b): the root plate wears the silhouette arc.
         let frame = Rect { x: 0.0, y: 0.0, width: w, height: h };
-        pc.plate(frame, (radius, radius, radius, radius), plate, cce_ui::layout::bevel_width());
+        pc.plate_spec(&cce_ui::scene::paint::PlateSpec {
+            rect: frame,
+            color: plate,
+            blur: false,
+            window_corners: (true, true, true, true),
+            depth: cce_ui::layout::bevel_width(),
+        });
 
         let rows = self.rows as usize;
         let pad = self.pad;
