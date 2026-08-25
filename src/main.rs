@@ -453,7 +453,7 @@ impl Application for TerminalApp {
         _qh: &QueueHandle<EngineState<Self>>,
         sender: calloop::channel::Sender<Self::Message>,
     ) -> Self {
-        let pad = cce_ui::layout::backplate_padding();
+        let pad = cce_ui::layout::root_plate_padding();
         // `.3` is the `fonts { terminal }` family (this was the 7-tuple's
         // fontconfig `terminal` alias before the DE's fonts moved into the
         // shared KDL config), falling back to Noto Sans Mono.
@@ -686,9 +686,9 @@ impl Application for TerminalApp {
         // The window plate, per the DE convention.
         let mut plate = cce_ui::color::page_low_color();
         if plate[3] > 0.001 {
-            plate[3] = cce_ui::color::active_backplate_opacity();
+            plate[3] = cce_ui::color::root_plate_opacity();
         }
-        let radius = cce_ui::colors::backplate_corner_radius();
+        let radius = cce_ui::colors::root_plate_corner_radius();
         let frame = Rect { x: 0.0, y: 0.0, width: w, height: h };
         pc.plate(frame, (radius, radius, radius, radius), plate, cce_ui::layout::bevel_width());
 
