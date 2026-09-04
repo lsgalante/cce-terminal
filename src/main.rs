@@ -49,7 +49,7 @@ use alacritty_terminal::vte::ansi::{
 use cce_ui::engine::{Application, EngineState, LogicalPosition, LogicalSize, WindowSettings};
 use cce_ui::scene::layout::Rect;
 use cce_ui::scene::paint::{DisplayList, PaintCtx, TextAttrs};
-use cce_ui::widget::{ElementState, Key, KeyEvent, MouseButton, MouseScrollDelta, NamedKey};
+use cce_ui::widget::{Bounds, ElementState, Key, KeyEvent, MouseButton, MouseScrollDelta, NamedKey, ScrollMotion};
 use wayland_client::QueueHandle;
 
 const INIT_W: u32 = 840;
@@ -191,8 +191,15 @@ struct TerminalApp {
     rows: u16,
     /// OSC title; polled by the engine through `settings().title`.
     title: Option<String>,
-    /// Fractional wheel-scroll remainder (trackpad pixel deltas).
+    /// Fractional wheel remainder for the whole-line wheel protocols (mouse
+    /// reports, alternate-scroll arrows), where a trackpad's pixel deltas
+    /// have to add up to a line before anything is sent.
     scroll_accum: f32,
+    /// Scrollback view motion in LINE units: `y.pos()` is the float display
+    /// offset — a notch glides it, a trackpad tracks it 1:1 and its flick
+    /// coasts (cce-ui's ScrollMotion) — and each frame the Term is stepped to
+    /// its rounding. Drawing stays line-quantized; only the offset is smooth.
+    scroll_motion: ScrollMotion,
     focused: bool,
     /// Left button held: pointer moves extend the selection.
     selecting: bool,
@@ -279,6 +286,44 @@ impl TerminalApp {
         if let Some(bytes) = mouse_report_bytes(*self.term.mode(), code, pressed, col, row) {
             self.write_pty(&bytes);
         }
+    }
+
+    /// Quantize wheel motion for the whole-line protocols, carrying the
+    /// fractional remainder across events.
+    fn take_whole_lines(&mut self, lines: f32) -> Option<i32> {
+        self.scroll_accum += lines;
+        let whole = self.scroll_accum as i32;
+        if whole == 0 {
+            return None;
+        }
+        self.scroll_accum -= whole as f32;
+        Some(whole)
+    }
+
+    /// Adopt view moves made behind the motion's back — PageUp/PageDown, the
+    /// snap to the bottom on a keypress or paste, new output pushing a held
+    /// view up the history — so the motion resumes from where the view is.
+    fn sync_scroll_motion(&mut self) {
+        let offset = self.term.grid().display_offset() as f32;
+        if self.scroll_motion.y.pos().round() != offset {
+            self.scroll_motion.y.jump_to(offset);
+        }
+    }
+
+    /// The scrollback offset's range: 0 (live bottom) ..= history length.
+    fn scrollback_bounds(&self) -> Bounds {
+        Bounds::max(self.term.grid().history_size() as f32)
+    }
+
+    /// Step the Term to the motion's rounded offset; true if the view moved.
+    fn apply_scroll_motion(&mut self) -> bool {
+        let target = self.scroll_motion.y.pos().round() as i32;
+        let current = self.term.grid().display_offset() as i32;
+        if target == current {
+            return false;
+        }
+        self.term.scroll_display(Scroll::Delta(target - current));
+        true
     }
 
     /// Send pasted text to the pty and snap the view to the bottom.
@@ -511,6 +556,7 @@ impl Application for TerminalApp {
             rows,
             title: None,
             scroll_accum: 0.0,
+            scroll_motion: ScrollMotion::new(),
             focused: true,
             selecting: false,
             last_click: None,
@@ -611,6 +657,20 @@ impl Application for TerminalApp {
         if self.bell > 0.0 {
             self.bell = (self.bell - dt * 4.0).max(0.0);
             *needs_rebuild = true;
+        }
+
+        // Wheel glide / trackpad coast through the scrollback: advance the
+        // line-unit motion and step the Term to its rounded offset, asking
+        // for frames while it is still moving.
+        if self.scroll_motion.is_animating() {
+            self.sync_scroll_motion();
+            if self.scroll_motion.is_animating() {
+                let bounds = self.scrollback_bounds();
+                self.scroll_motion.tick(dt, Bounds::max(0.0), bounds);
+                if self.apply_scroll_motion() || self.scroll_motion.is_animating() {
+                    *needs_rebuild = true;
+                }
+            }
         }
 
         // Selection autoscroll: while a drag holds the pointer in the top or
@@ -1071,15 +1131,13 @@ impl Application for TerminalApp {
         pos: LogicalPosition,
         needs_rebuild: &mut bool,
     ) {
-        self.scroll_accum += delta.notches_y() * SCROLL_LINES_PER_NOTCH;
-        let lines = self.scroll_accum as i32;
-        if lines == 0 {
-            return;
-        }
-        self.scroll_accum -= lines as f32;
+        // Lines, signed like the display offset: up is positive.
+        let lines = delta.notches_y() * SCROLL_LINES_PER_NOTCH;
 
-        // Wheel reports take precedence over alternate-scroll arrows.
+        // Wheel reports take precedence over alternate-scroll arrows. Both
+        // are whole-line protocols and stay quantized.
         if self.mouse_reporting() {
+            let Some(lines) = self.take_whole_lines(lines) else { return };
             let (col, row) = self.viewport_cell(pos);
             let code = if lines > 0 { 64 } else { 65 } + self.report_mods();
             for _ in 0..lines.unsigned_abs() {
@@ -1091,11 +1149,27 @@ impl Application for TerminalApp {
         let mode = *self.term.mode();
         if mode.contains(TermMode::ALT_SCREEN) && mode.contains(TermMode::ALTERNATE_SCROLL) {
             // Full-screen apps without mouse reporting get arrow keys.
+            let Some(lines) = self.take_whole_lines(lines) else { return };
             let key: &[u8] = if lines > 0 { b"\x1b[A" } else { b"\x1b[B" };
             let bytes = key.repeat(lines.unsigned_abs() as usize);
             self.write_pty(&bytes);
-        } else {
-            self.term.scroll_display(Scroll::Delta(lines));
+            return;
+        }
+
+        // Scrollback: feed the line-unit motion. `apply_px` rather than
+        // `apply` — that one's sign flip and 1:1 pixel path are for pixel
+        // offsets, whereas here up grows the offset and the delta is already
+        // in lines. A finger lift arrives as a zero delta and must reach the
+        // motion (it is what starts the coast), so no early return on zero.
+        self.sync_scroll_motion();
+        let bounds = self.scrollback_bounds();
+        let discrete = matches!(delta, MouseScrollDelta::LineDelta(..));
+        let moved = self.scroll_motion.apply_px(0.0, lines, discrete, Bounds::max(0.0), bounds);
+        if moved && self.apply_scroll_motion() {
+            *needs_rebuild = true;
+        }
+        if self.scroll_motion.is_animating() {
+            // A notch only moved the target; tick glides the view there.
             *needs_rebuild = true;
         }
     }
