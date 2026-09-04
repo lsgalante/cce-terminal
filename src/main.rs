@@ -19,6 +19,11 @@
 //! reports at cell coordinates, plus focus in/out (1004); holding Shift
 //! bypasses reporting so selection stays reachable, per convention.
 //!
+//! The window plate carries the DE's corner control ([`plate_menu`]): the
+//! circular trigger on the top-right that cce-designer's panes wear, opening
+//! a menu of the actions a menubar-less terminal has nowhere else to put —
+//! copy/paste, text zoom, scrollback and terminal resets, a new window.
+//!
 //! Config (KDL, live-reloaded on file change): a `terminal { … }` section in
 //! the shared `~/.config/cce/config.kdl` or the per-app
 //! `~/.config/cce/cce-terminal/config.kdl` (app file wins) with `font_size`,
@@ -32,6 +37,7 @@
 
 mod clip;
 mod colors;
+mod plate_menu;
 mod pty;
 
 use std::io::{Read, Write};
@@ -75,8 +81,11 @@ struct Settings {
 }
 
 impl Settings {
-    fn load(font_family: &str) -> Self {
-        let font_size = cce_ui::config::get_f32("/terminal/font_size", 14.0).clamp(6.0, 72.0);
+    /// `zoom_steps` is the corner menu's text zoom: one point per step over
+    /// the configured size, session-only (a config edit keeps the zoom).
+    fn load(font_family: &str, zoom_steps: i32) -> Self {
+        let font_size = (cce_ui::config::get_f32("/terminal/font_size", 14.0) + zoom_steps as f32)
+            .clamp(6.0, 72.0);
         let scrollback =
             cce_ui::config::get_i64("/terminal/scrollback", 5000).clamp(0, 200_000) as usize;
         // Measure the real glyph advance; the 0.60 em toolkit estimate is the
@@ -230,6 +239,10 @@ struct TerminalApp {
     mouse_buttons: u8,
     /// Cell of the last motion report — motion is per-cell, not per-pixel.
     last_mouse_cell: Option<(usize, usize)>,
+    /// Corner-menu text zoom, in points over the configured font size.
+    zoom_steps: i32,
+    /// Rows of the OPEN corner menu (empty = not open); see [`plate_menu`].
+    plate_menu_actions: Vec<plate_menu::PlateMenuAction>,
 }
 
 impl TerminalApp {
@@ -323,6 +336,23 @@ impl TerminalApp {
             return false;
         }
         self.term.scroll_display(Scroll::Delta(target - current));
+        true
+    }
+
+    /// Swap in re-derived settings (a config edit, a zoom step) and reflow
+    /// the grid and pty to match. `true` when anything changed.
+    fn apply_settings(&mut self, reloaded: Settings) -> bool {
+        let old = std::mem::replace(&mut self.settings, reloaded);
+        if reloaded == old {
+            return false;
+        }
+        let (cols, rows) = self.grid_for(self.win_w, self.win_h);
+        if (cols, rows) != (self.cols, self.rows) {
+            self.cols = cols;
+            self.rows = rows;
+            self.pty.resize(cols, rows);
+            self.term.resize(TermDims { cols, rows });
+        }
         true
     }
 
@@ -503,7 +533,7 @@ impl Application for TerminalApp {
         // fontconfig `terminal` alias before the DE's fonts moved into the
         // shared KDL config), falling back to Noto Sans Mono.
         let font = cce_ui::layout::read_preferred_fonts().3;
-        let settings = Settings::load(&font);
+        let settings = Settings::load(&font, 0);
         let config_stamp = cce_ui::config::config_files_modified();
         let (cols, rows) = grid_dims(INIT_W as f32, INIT_H as f32, pad, &settings);
 
@@ -574,6 +604,8 @@ impl Application for TerminalApp {
             alt_down: false,
             mouse_buttons: 0,
             last_mouse_cell: None,
+            zoom_steps: 0,
+            plate_menu_actions: Vec::new(),
         }
     }
 
@@ -713,17 +745,9 @@ impl Application for TerminalApp {
         }
         self.config_stamp = stamp;
         let font = self.font.clone();
-        let reloaded = Settings::load(&font);
-        let old = std::mem::replace(&mut self.settings, reloaded);
-        if reloaded != old {
+        let reloaded = Settings::load(&font, self.zoom_steps);
+        if self.apply_settings(reloaded) {
             *needs_rebuild = true;
-            let (cols, rows) = self.grid_for(self.win_w, self.win_h);
-            if (cols, rows) != (self.cols, self.rows) {
-                self.cols = cols;
-                self.rows = rows;
-                self.pty.resize(cols, rows);
-                self.term.resize(TermDims { cols, rows });
-            }
         }
     }
 
@@ -979,6 +1003,9 @@ impl Application for TerminalApp {
             pc.quad(frame, quad_color(cfg_palette.foreground, 0.12 * self.bell));
         }
 
+        // The corner control over the grid, and its menu over everything.
+        self.paint_plate_menu(&mut pc);
+
         Some(pc.finish())
     }
 
@@ -1005,7 +1032,19 @@ impl Application for TerminalApp {
         if std::env::var_os("CCE_TERM_DEBUG").is_some() {
             eprintln!("[input] move ({:.1},{:.1}) selecting={}", pos.x, pos.y, self.selecting);
         }
+        // The corner control's hover emphasis is a repaint; the open menu
+        // takes the pointer exclusively (its own row hover).
+        let was_on_corner = self.plate_corner_hit(self.last_pointer.x as f32, self.last_pointer.y as f32);
         self.last_pointer = pos;
+        if self.plate_menu_open() {
+            if cce_ui::widget::context_menu::cursor_moved(pos.x as f32, pos.y as f32) {
+                *needs_rebuild = true;
+            }
+            return;
+        }
+        if self.plate_corner_hit(pos.x as f32, pos.y as f32) != was_on_corner {
+            *needs_rebuild = true;
+        }
         if self.mouse_reporting() && !self.selecting {
             let mode = *self.term.mode();
             let motion_wanted = mode.contains(TermMode::MOUSE_MOTION)
@@ -1063,6 +1102,23 @@ impl Application for TerminalApp {
                 ElementState::Pressed => self.mouse_buttons |= 1 << bit,
                 ElementState::Released => self.mouse_buttons &= !(1 << bit),
             }
+        }
+
+        // The corner menu, ahead of everything: an open menu owns every
+        // button event, and a left press on the control opens it (and never
+        // reaches the grid — not as a selection, not as a mouse report).
+        let (px, py) = (pos.x as f32, pos.y as f32);
+        if self.handle_plate_menu_input(button, state, px, py) {
+            *needs_rebuild = true;
+            return None;
+        }
+        if button == MouseButton::Left
+            && state == ElementState::Pressed
+            && self.plate_corner_hit(px, py)
+        {
+            self.open_plate_menu();
+            *needs_rebuild = true;
+            return None;
         }
 
         // Application-owned pointer: report and stop — no selection, no
@@ -1186,6 +1242,13 @@ impl Application for TerminalApp {
             _ => {}
         }
         if event.state != ElementState::Pressed {
+            return None;
+        }
+
+        // Escape dismisses the corner menu instead of reaching the shell.
+        if self.plate_menu_open() && matches!(event.logical_key, Key::Named(NamedKey::Escape)) {
+            self.close_plate_menu();
+            *needs_rebuild = true;
             return None;
         }
 
