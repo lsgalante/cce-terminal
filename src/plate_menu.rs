@@ -6,17 +6,20 @@
 //! The terminal has one plate — the window itself — so the toolkit's dock
 //! vocabulary (collapse, detach) does not apply; the rows are the actions a
 //! terminal without a menubar has nowhere else to put: the clipboard pair,
-//! text zoom, scrollback/state resets, and a new window. Geometry is the
-//! toolkit's (`corner_center` on the window rect), the menu is the shared
-//! `context_menu`, and the rows are dispatched here — the same
-//! `plate_menu_actions` + `handle_plate_menu_click` contract as the designer.
+//! text zoom, scrollback/state resets, the tabs, and a new window. The tabs
+//! borrow the designer's dock-tab language: every tab listed as a radio row
+//! (the shown one marked, so the list reads as state), then New Tab and
+//! Close Tab. Geometry is the toolkit's (`corner_center` on the window
+//! rect), the menu is the shared `context_menu`, and the rows are dispatched
+//! here — the same `plate_menu_actions` + `handle_plate_menu_click` contract
+//! as the designer.
 
 use alacritty_terminal::grid::Scroll;
 use alacritty_terminal::vte::ansi::Handler;
 use cce_ui::widget::plate_dock::{self, CORNER_R};
 use cce_ui::widget::{context_menu, ElementState, MouseButton, WidgetId};
 
-use crate::TerminalApp;
+use crate::{TabId, TerminalApp};
 
 /// What the corner menu can do to the terminal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -32,8 +35,15 @@ pub enum PlateMenuAction {
     ResetTextSize,
     /// Drop the scrollback history (the viewport stays).
     ClearScrollback,
-    /// Full VT reset: modes, colors, tabs, the alternate screen.
+    /// Full VT reset: modes, colors, tab stops, the alternate screen.
     ResetTerminal,
+    /// Bring the named tab to the front. By id, not index: a tab whose
+    /// shell exits while the menu is open shifts the indices under it.
+    ShowTab(TabId),
+    /// A fresh shell in the active tab's directory, shown.
+    NewTab,
+    /// Close the active tab (its shell is killed).
+    CloseTab,
     /// Another cce-terminal, detached.
     NewWindow,
     /// A "-" row: engraved, inert — keeps the actions aligned with the option
@@ -74,7 +84,7 @@ impl TerminalApp {
             actions.push(action);
         };
 
-        if self.term.selection_to_string().is_some_and(|s| !s.is_empty()) {
+        if self.tab().term.selection_to_string().is_some_and(|s| !s.is_empty()) {
             row("Copy", PlateMenuAction::Copy);
         }
         row("Paste", PlateMenuAction::Paste);
@@ -87,6 +97,18 @@ impl TerminalApp {
         row("-", PlateMenuAction::Separator);
         row("Clear Scrollback", PlateMenuAction::ClearScrollback);
         row("Reset Terminal", PlateMenuAction::ResetTerminal);
+        row("-", PlateMenuAction::Separator);
+        // The tabs as a RADIO group: every one listed, the shown one marked.
+        // Clicking the marked row is a no-op (show_tab declines the active
+        // index), so the list reads as state, not just as actions.
+        for (i, tab) in self.tabs.iter().enumerate() {
+            let mark = if i == self.active { "●" } else { "○" };
+            row(&format!("{mark} {}", tab.label(i)), PlateMenuAction::ShowTab(tab.id));
+        }
+        row("New Tab", PlateMenuAction::NewTab);
+        if self.tabs.len() > 1 {
+            row("Close Tab", PlateMenuAction::CloseTab);
+        }
         row("-", PlateMenuAction::Separator);
         row("New Window", PlateMenuAction::NewWindow);
 
@@ -137,7 +159,7 @@ impl TerminalApp {
     fn dispatch_plate_menu(&mut self, action: PlateMenuAction) {
         match action {
             PlateMenuAction::Copy => {
-                if let Some(text) = self.term.selection_to_string() {
+                if let Some(text) = self.tab().term.selection_to_string() {
                     if !text.is_empty() {
                         cce_ui::widget::clipboard::copy_to_clipboard(&text);
                     }
@@ -157,15 +179,20 @@ impl TerminalApp {
                 // Drop the view to the live screen first: a display offset
                 // into history that no longer exists is not a state the grid
                 // guards against.
-                self.term.scroll_display(Scroll::Bottom);
-                self.term.grid_mut().clear_history();
+                let term = &mut self.tab_mut().term;
+                term.scroll_display(Scroll::Bottom);
+                term.grid_mut().clear_history();
                 self.sync_scroll_motion();
             }
             PlateMenuAction::ResetTerminal => {
-                self.term.selection = None;
-                self.term.reset_state();
+                let term = &mut self.tab_mut().term;
+                term.selection = None;
+                term.reset_state();
                 self.sync_scroll_motion();
             }
+            PlateMenuAction::ShowTab(id) => self.show_tab_by_id(id),
+            PlateMenuAction::NewTab => self.new_tab(),
+            PlateMenuAction::CloseTab => self.close_active_tab(),
             PlateMenuAction::NewWindow => match std::env::current_exe() {
                 Ok(exe) => {
                     if let Err(e) = cce_ui::process::spawn_detached(std::process::Command::new(exe)) {

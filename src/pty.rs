@@ -15,8 +15,15 @@ pub struct Pty {
 /// Open a pty pair and spawn `command` (or `$SHELL`) on the slave side, in
 /// its own session with the slave as controlling terminal. The slave fd is
 /// fully handed to the child (stdin/stdout/stderr) and closed in the parent,
-/// so EOF on the master is the child-exit signal.
-pub fn spawn_shell(cols: u16, rows: u16, command: Option<&[String]>) -> io::Result<Pty> {
+/// so EOF on the master is the child-exit signal. `cwd` starts the child
+/// there (a new tab inherits the active one's directory); `None` inherits
+/// the terminal's own.
+pub fn spawn_shell(
+    cols: u16,
+    rows: u16,
+    command: Option<&[String]>,
+    cwd: Option<&std::path::Path>,
+) -> io::Result<Pty> {
     let mut master: libc::c_int = -1;
     let mut slave: libc::c_int = -1;
     let ws = libc::winsize { ws_row: rows, ws_col: cols, ws_xpixel: 0, ws_ypixel: 0 };
@@ -45,6 +52,11 @@ pub fn spawn_shell(cols: u16, rows: u16, command: Option<&[String]>) -> io::Resu
         .stdin(Stdio::from(slave.try_clone()?))
         .stdout(Stdio::from(slave.try_clone()?))
         .stderr(Stdio::from(slave));
+    // A directory that vanished since it was read is not worth failing the
+    // spawn over — the child just starts where the terminal did.
+    if let Some(dir) = cwd.filter(|d| d.is_dir()) {
+        cmd.current_dir(dir);
+    }
     unsafe {
         cmd.pre_exec(|| {
             if libc::setsid() < 0 {
@@ -89,7 +101,7 @@ mod tests {
     /// window (the GUI path is `handle_key_input` → the same master fd).
     #[test]
     fn shell_round_trip() {
-        let mut pty = spawn_shell(80, 24, None).expect("openpty/spawn");
+        let mut pty = spawn_shell(80, 24, None, None).expect("openpty/spawn");
         let mut writer = pty.dup_handle().unwrap();
         let mut reader = pty.dup_handle().unwrap();
         writer.write_all(b"printf 'RT-%s\\n' OK; exit\r").unwrap();

@@ -22,7 +22,13 @@
 //! The window plate carries the DE's corner control ([`plate_menu`]): the
 //! circular trigger on the top-right that cce-designer's panes wear, opening
 //! a menu of the actions a menubar-less terminal has nowhere else to put —
-//! copy/paste, text zoom, scrollback and terminal resets, a new window.
+//! copy/paste, text zoom, scrollback and terminal resets, a new window, and
+//! the tabs. A tab ([`Tab`]) is one shell on one pty with its own `Term`,
+//! title, view offset and bell; the window shows the active one and the
+//! menu lists them as a radio group (the designer's dock-tab language) with
+//! New Tab / Close Tab. There is no tab bar: the title carries `[i/n]` while
+//! more than one is open. Rebindable chords (`cce-terminal` domain in
+//! input.kdl): `new_tab`, `close_tab`, `next_tab`, `prev_tab`.
 //!
 //! Config (KDL, live-reloaded on file change): a `terminal { … }` section in
 //! the shared `~/.config/cce/config.kdl` or the per-app
@@ -41,6 +47,7 @@ mod plate_menu;
 mod pty;
 
 use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use alacritty_terminal::event::{Event as TermEvent, EventListener, WindowSize};
@@ -139,6 +146,10 @@ struct Keys {
     paste: String,
     scroll_up: String,
     scroll_down: String,
+    new_tab: String,
+    close_tab: String,
+    next_tab: String,
+    prev_tab: String,
 }
 
 impl Keys {
@@ -149,15 +160,27 @@ impl Keys {
             paste: get("paste", "ctrl+shift+v"),
             scroll_up: get("scroll_up", "shift+pageup"),
             scroll_down: get("scroll_down", "shift+pagedown"),
+            // The gnome-terminal chords; Ctrl+PageUp/Down are taken from the
+            // shell (they would encode as CSI 5;5~ / 6;5~ otherwise).
+            new_tab: get("new_tab", "ctrl+shift+t"),
+            close_tab: get("close_tab", "ctrl+shift+w"),
+            next_tab: get("next_tab", "ctrl+pagedown"),
+            prev_tab: get("prev_tab", "ctrl+pageup"),
         }
     }
 }
 
+/// A tab's identity for its lifetime. Messages from the pty reader thread
+/// and the Term's event proxy are keyed on it rather than on a `Vec` index,
+/// which shifts when an earlier tab closes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TabId(u64);
+
 #[derive(Clone)]
 enum Msg {
-    Pty(Vec<u8>),
-    PtyClosed,
-    Term(TermEvent),
+    Pty(TabId, Vec<u8>),
+    PtyClosed(TabId),
+    Term(TabId, TermEvent),
 }
 
 /// The terminal's grid dimensions, for `Term::new`/`resize`.
@@ -179,36 +202,143 @@ impl Dimensions for TermDims {
     }
 }
 
-/// Forwards `Term`'s synthesized events (pty write-backs, title changes …)
-/// into the engine's message channel; they are handled in `update`.
-struct EventProxy(calloop::channel::Sender<Msg>);
+/// Forwards a tab's `Term` events (pty write-backs, title changes …) into
+/// the engine's message channel, tagged with the tab; handled in `update`.
+struct EventProxy {
+    sender: calloop::channel::Sender<Msg>,
+    id: TabId,
+}
 
 impl EventListener for EventProxy {
     fn send_event(&self, event: TermEvent) {
-        let _ = self.0.send(Msg::Term(event));
+        let _ = self.sender.send(Msg::Term(self.id, event));
     }
 }
 
-struct TerminalApp {
+/// One shell on one pty: the VT state and everything that is per-view
+/// rather than per-window. Gesture state (selection drag, multi-click,
+/// wheel remainders) stays on the app: it belongs to the pointer, and a
+/// tab switch simply drops it.
+struct Tab {
+    id: TabId,
     term: Term<EventProxy>,
     parser: Processor,
     pty: pty::Pty,
     writer: std::fs::File,
-    font: String,
-    pad: f32,
-    cols: u16,
-    rows: u16,
-    /// OSC title; polled by the engine through `settings().title`.
+    /// OSC title; the active tab's is polled by the engine through
+    /// `settings().title`, every tab's names its menu row.
     title: Option<String>,
-    /// Fractional wheel remainder for the whole-line wheel protocols (mouse
-    /// reports, alternate-scroll arrows), where a trackpad's pixel deltas
-    /// have to add up to a line before anything is sent.
-    scroll_accum: f32,
     /// Scrollback view motion in LINE units: `y.pos()` is the float display
     /// offset — a notch glides it, a trackpad tracks it 1:1 and its flick
     /// coasts (cce-ui's ScrollMotion) — and each frame the Term is stepped to
     /// its rounding. Drawing stays line-quantized; only the offset is smooth.
     scroll_motion: ScrollMotion,
+    /// Bell flash intensity, 1.0 → 0 over ~a quarter second (decayed in tick).
+    bell: f32,
+    /// Cell of the last motion report — motion is per-cell, not per-pixel.
+    last_mouse_cell: Option<(usize, usize)>,
+}
+
+impl Tab {
+    /// Spawn a shell (or `command`) on a fresh pty sized to the grid, start
+    /// its reader thread, and build the Term that will parse it.
+    fn spawn(
+        id: TabId,
+        cols: u16,
+        rows: u16,
+        settings: &Settings,
+        sender: &calloop::channel::Sender<Msg>,
+        command: Option<&[String]>,
+        cwd: Option<&Path>,
+    ) -> std::io::Result<Tab> {
+        let pty = pty::spawn_shell(cols, rows, command, cwd)?;
+        let writer = pty.dup_handle()?;
+        let mut reader = pty.dup_handle()?;
+        let pty_sender = sender.clone();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 8192];
+            loop {
+                match reader.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        if pty_sender.send(Msg::Pty(id, buf[..n].to_vec())).is_err() {
+                            return;
+                        }
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    // EIO when the last slave fd closes: the normal exit path.
+                    Err(_) => break,
+                }
+            }
+            let _ = pty_sender.send(Msg::PtyClosed(id));
+        });
+
+        let config =
+            TermConfig { scrolling_history: settings.scrollback, ..TermConfig::default() };
+        let term = Term::new(
+            config,
+            &TermDims { cols, rows },
+            EventProxy { sender: sender.clone(), id },
+        );
+        Ok(Tab {
+            id,
+            term,
+            parser: Processor::new(),
+            pty,
+            writer,
+            title: None,
+            scroll_motion: ScrollMotion::new(),
+            bell: 0.0,
+            last_mouse_cell: None,
+        })
+    }
+
+    /// The shell's current directory (via /proc), so a new tab can start
+    /// where this one is. The shell itself, not its foreground job: that is
+    /// where the next prompt will be.
+    fn cwd(&self) -> Option<PathBuf> {
+        std::fs::read_link(format!("/proc/{}/cwd", self.pty.child.id())).ok()
+    }
+
+    /// The tab's menu row text: its title, or "Tab n" before one arrives,
+    /// clipped so a long OSC title does not stretch the menu.
+    fn label(&self, n: usize) -> String {
+        const MAX: usize = 32;
+        let title = match &self.title {
+            Some(t) if !t.trim().is_empty() => t.trim().to_string(),
+            _ => return format!("Tab {}", n + 1),
+        };
+        if title.chars().count() <= MAX {
+            title
+        } else {
+            let head: String = title.chars().take(MAX - 1).collect();
+            format!("{head}…")
+        }
+    }
+
+    /// Kill the shell and reap it. Closing a tab, not the shell exiting on
+    /// its own — that arrives as `Msg::PtyClosed` from the reader thread.
+    fn kill(&mut self) {
+        let _ = self.pty.child.kill();
+        let _ = self.pty.child.wait();
+    }
+}
+
+struct TerminalApp {
+    /// The engine's message channel, kept so new tabs can spawn onto it.
+    sender: calloop::channel::Sender<Msg>,
+    /// Never empty while the app runs: the last shell exiting exits the app.
+    tabs: Vec<Tab>,
+    active: usize,
+    next_tab_id: u64,
+    font: String,
+    pad: f32,
+    cols: u16,
+    rows: u16,
+    /// Fractional wheel remainder for the whole-line wheel protocols (mouse
+    /// reports, alternate-scroll arrows), where a trackpad's pixel deltas
+    /// have to add up to a line before anything is sent.
+    scroll_accum: f32,
     focused: bool,
     /// Left button held: pointer moves extend the selection.
     selecting: bool,
@@ -220,8 +350,6 @@ struct TerminalApp {
     /// Config-file mtime at the last (re)load — tick polls it so palette and
     /// font-size edits apply live, per the DE's edit-the-file convention.
     config_stamp: Option<std::time::SystemTime>,
-    /// Bell flash intensity, 1.0 → 0 over ~a quarter second (decayed in tick).
-    bell: f32,
     /// Last pointer position (any state) — tick's autoscroll reads it while a
     /// selection drag holds the pointer in the frame's edge padding.
     last_pointer: LogicalPosition,
@@ -237,8 +365,6 @@ struct TerminalApp {
     alt_down: bool,
     /// Held buttons for drag-motion reports: bit 0 left, 1 middle, 2 right.
     mouse_buttons: u8,
-    /// Cell of the last motion report — motion is per-cell, not per-pixel.
-    last_mouse_cell: Option<(usize, usize)>,
     /// Corner-menu text zoom, in points over the configured font size.
     zoom_steps: i32,
     /// Rows of the OPEN corner menu (empty = not open); see [`plate_menu`].
@@ -246,12 +372,105 @@ struct TerminalApp {
 }
 
 impl TerminalApp {
+    fn tab(&self) -> &Tab {
+        &self.tabs[self.active]
+    }
+
+    fn tab_mut(&mut self) -> &mut Tab {
+        &mut self.tabs[self.active]
+    }
+
+    fn tab_index(&self, id: TabId) -> Option<usize> {
+        self.tabs.iter().position(|t| t.id == id)
+    }
+
+    /// Open a new tab after the active one, in the active shell's directory,
+    /// and switch to it.
+    fn new_tab(&mut self) {
+        let id = TabId(self.next_tab_id);
+        self.next_tab_id += 1;
+        let cwd = self.tab().cwd();
+        match Tab::spawn(id, self.cols, self.rows, &self.settings, &self.sender, None, cwd.as_deref()) {
+            Ok(tab) => {
+                let at = self.active + 1;
+                self.tabs.insert(at, tab);
+                self.show_tab(at);
+            }
+            Err(e) => log::warn!("cce-terminal: failed to spawn a new tab: {e}"),
+        }
+    }
+
+    /// Make tab `i` the visible one. Apps tracking focus (1004) in either
+    /// tab see the switch as focus leaving one and reaching the other.
+    fn show_tab(&mut self, i: usize) {
+        if i >= self.tabs.len() || i == self.active {
+            return;
+        }
+        if self.focused && self.tab().term.mode().contains(TermMode::FOCUS_IN_OUT) {
+            self.write_pty(b"\x1b[O");
+        }
+        self.active = i;
+        // Pointer gestures do not survive the switch: they were about the
+        // old tab's cells.
+        self.selecting = false;
+        self.last_click = None;
+        self.click_count = 0;
+        self.scroll_accum = 0.0;
+        self.autoscroll_accum = 0.0;
+        if self.focused && self.tab().term.mode().contains(TermMode::FOCUS_IN_OUT) {
+            self.write_pty(b"\x1b[I");
+        }
+    }
+
+    fn show_tab_by_id(&mut self, id: TabId) {
+        if let Some(i) = self.tab_index(id) {
+            self.show_tab(i);
+        }
+    }
+
+    /// Next/previous tab, wrapping.
+    fn cycle_tab(&mut self, delta: i32) {
+        let n = self.tabs.len() as i32;
+        if n > 1 {
+            self.show_tab(((self.active as i32 + delta).rem_euclid(n)) as usize);
+        }
+    }
+
+    /// Close the active tab. The last tab is the window: killing its shell
+    /// ends the pty, and the reader thread's `PtyClosed` exits the app the
+    /// way a typed `exit` would, so there is never a tabless window.
+    fn close_active_tab(&mut self) {
+        if self.tabs.len() == 1 {
+            self.tab_mut().kill();
+            return;
+        }
+        let mut tab = self.tabs.remove(self.active);
+        tab.kill();
+        let i = self.active.min(self.tabs.len() - 1);
+        // `show_tab` declines a same-index switch, so drop the gesture
+        // state here — the tab under the pointer changed either way.
+        self.active = i;
+        self.selecting = false;
+        self.last_click = None;
+        self.click_count = 0;
+    }
+
     fn grid_for(&self, w: f32, h: f32) -> (u16, u16) {
         grid_dims(w, h, self.pad, &self.settings)
     }
 
     fn write_pty(&mut self, bytes: &[u8]) {
-        let _ = self.writer.write_all(bytes);
+        let _ = self.tab_mut().writer.write_all(bytes);
+    }
+
+    /// Resize every tab's pty and Term to the current grid.
+    fn resize_tabs(&mut self, cols: u16, rows: u16) {
+        self.cols = cols;
+        self.rows = rows;
+        for tab in &mut self.tabs {
+            tab.pty.resize(cols, rows);
+            tab.term.resize(TermDims { cols, rows });
+        }
     }
 
     fn cell_rect(&self, row: usize, col: usize, width_cells: usize) -> Rect {
@@ -278,7 +497,7 @@ impl TerminalApp {
     fn grid_point(&self, pos: LogicalPosition) -> (Point, Side) {
         let (col, row) = self.viewport_cell(pos);
         let col_f = ((pos.x as f32 - self.pad) / self.settings.cell_w).max(0.0);
-        let line = Line(row as i32 - self.term.grid().display_offset() as i32);
+        let line = Line(row as i32 - self.tab().term.grid().display_offset() as i32);
         let side = if col_f.fract() > 0.5 { Side::Right } else { Side::Left };
         (Point::new(line, Column(col)), side)
     }
@@ -286,7 +505,7 @@ impl TerminalApp {
     /// Whether pointer events currently belong to the application rather than
     /// the selection machinery (Shift bypasses, per convention).
     fn mouse_reporting(&self) -> bool {
-        self.term.mode().intersects(TermMode::MOUSE_MODE) && !self.shift_down
+        self.tab().term.mode().intersects(TermMode::MOUSE_MODE) && !self.shift_down
     }
 
     /// Modifier bits added to every report's button code. Shift never
@@ -296,7 +515,7 @@ impl TerminalApp {
     }
 
     fn send_mouse_report(&mut self, code: u8, pressed: bool, col: usize, row: usize) {
-        if let Some(bytes) = mouse_report_bytes(*self.term.mode(), code, pressed, col, row) {
+        if let Some(bytes) = mouse_report_bytes(*self.tab().term.mode(), code, pressed, col, row) {
             self.write_pty(&bytes);
         }
     }
@@ -317,25 +536,27 @@ impl TerminalApp {
     /// snap to the bottom on a keypress or paste, new output pushing a held
     /// view up the history — so the motion resumes from where the view is.
     fn sync_scroll_motion(&mut self) {
-        let offset = self.term.grid().display_offset() as f32;
-        if self.scroll_motion.y.pos().round() != offset {
-            self.scroll_motion.y.jump_to(offset);
+        let tab = self.tab_mut();
+        let offset = tab.term.grid().display_offset() as f32;
+        if tab.scroll_motion.y.pos().round() != offset {
+            tab.scroll_motion.y.jump_to(offset);
         }
     }
 
     /// The scrollback offset's range: 0 (live bottom) ..= history length.
     fn scrollback_bounds(&self) -> Bounds {
-        Bounds::max(self.term.grid().history_size() as f32)
+        Bounds::max(self.tab().term.grid().history_size() as f32)
     }
 
     /// Step the Term to the motion's rounded offset; true if the view moved.
     fn apply_scroll_motion(&mut self) -> bool {
-        let target = self.scroll_motion.y.pos().round() as i32;
-        let current = self.term.grid().display_offset() as i32;
+        let tab = self.tab_mut();
+        let target = tab.scroll_motion.y.pos().round() as i32;
+        let current = tab.term.grid().display_offset() as i32;
         if target == current {
             return false;
         }
-        self.term.scroll_display(Scroll::Delta(target - current));
+        tab.term.scroll_display(Scroll::Delta(target - current));
         true
     }
 
@@ -348,21 +569,19 @@ impl TerminalApp {
         }
         let (cols, rows) = self.grid_for(self.win_w, self.win_h);
         if (cols, rows) != (self.cols, self.rows) {
-            self.cols = cols;
-            self.rows = rows;
-            self.pty.resize(cols, rows);
-            self.term.resize(TermDims { cols, rows });
+            self.resize_tabs(cols, rows);
         }
         true
     }
 
     /// Send pasted text to the pty and snap the view to the bottom.
     fn paste(&mut self, text: &str) {
-        let bracketed = self.term.mode().contains(TermMode::BRACKETED_PASTE);
+        let bracketed = self.tab().term.mode().contains(TermMode::BRACKETED_PASTE);
         let bytes = paste_bytes(text, bracketed);
         self.write_pty(&bytes);
-        if self.term.grid().display_offset() != 0 {
-            self.term.scroll_display(Scroll::Bottom);
+        let term = &mut self.tab_mut().term;
+        if term.grid().display_offset() != 0 {
+            term.scroll_display(Scroll::Bottom);
         }
     }
 }
@@ -548,45 +767,21 @@ impl Application for TerminalApp {
             None => None,
         };
 
-        let pty = pty::spawn_shell(cols, rows, command.as_deref())
+        // The first tab runs the command (later tabs are plain shells) and
+        // inherits the terminal's own directory.
+        let first = Tab::spawn(TabId(0), cols, rows, &settings, &sender, command.as_deref(), None)
             .expect("cce-terminal: failed to spawn shell on pty");
-        let writer = pty.dup_handle().expect("cce-terminal: pty dup failed");
-        let mut reader = pty.dup_handle().expect("cce-terminal: pty dup failed");
-        let pty_sender = sender.clone();
-        std::thread::spawn(move || {
-            let mut buf = [0u8; 8192];
-            loop {
-                match reader.read(&mut buf) {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        if pty_sender.send(Msg::Pty(buf[..n].to_vec())).is_err() {
-                            return;
-                        }
-                    }
-                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                    // EIO when the last slave fd closes: the normal exit path.
-                    Err(_) => break,
-                }
-            }
-            let _ = pty_sender.send(Msg::PtyClosed);
-        });
-
-        let config =
-            TermConfig { scrolling_history: settings.scrollback, ..TermConfig::default() };
-        let term = Term::new(config, &TermDims { cols, rows }, EventProxy(sender));
 
         TerminalApp {
-            term,
-            parser: Processor::new(),
-            pty,
-            writer,
+            sender,
+            tabs: vec![first],
+            active: 0,
+            next_tab_id: 1,
             font,
             pad,
             cols,
             rows,
-            title: None,
             scroll_accum: 0.0,
-            scroll_motion: ScrollMotion::new(),
             focused: true,
             selecting: false,
             last_click: None,
@@ -594,7 +789,6 @@ impl Application for TerminalApp {
             settings,
             keys: Keys::load(),
             config_stamp,
-            bell: 0.0,
             last_pointer: LogicalPosition::new(0.0, 0.0),
             autoscroll_accum: 0.0,
             win_w: INIT_W as f32,
@@ -603,15 +797,20 @@ impl Application for TerminalApp {
             ctrl_down: false,
             alt_down: false,
             mouse_buttons: 0,
-            last_mouse_cell: None,
             zoom_steps: 0,
             plate_menu_actions: Vec::new(),
         }
     }
 
     fn settings(&self) -> WindowSettings {
+        // The active tab's title; with several tabs and no tab bar, the
+        // title is where "which one, of how many" shows.
+        let mut title = self.tab().title.clone().unwrap_or_else(|| "cce-terminal".to_string());
+        if self.tabs.len() > 1 {
+            title = format!("{title} [{}/{}]", self.active + 1, self.tabs.len());
+        }
         WindowSettings {
-            title: self.title.clone().unwrap_or_else(|| "cce-terminal".to_string()),
+            title,
             app_id: "cce-terminal".to_string(),
             width: INIT_W,
             height: INIT_H,
@@ -621,41 +820,69 @@ impl Application for TerminalApp {
     }
 
     fn update(&mut self, msg: Self::Message, needs_rebuild: &mut bool, exit: &mut bool) {
+        // Every message names its tab; one from a tab already closed (its
+        // reader thread outlives the kill by a moment) is simply dropped.
+        // Background tabs keep parsing but never ask for a frame: nothing
+        // of theirs is on screen except their menu label and the title.
+        let (id, is_active) = match &msg {
+            Msg::Pty(id, _) | Msg::PtyClosed(id) | Msg::Term(id, _) => {
+                let Some(i) = self.tab_index(*id) else { return };
+                (i, i == self.active)
+            }
+        };
+        let window = WindowSize {
+            num_lines: self.rows,
+            num_cols: self.cols,
+            cell_width: self.settings.cell_w as u16,
+            cell_height: self.settings.line_h as u16,
+        };
+        let palette = self.settings.palette;
+        let tab = &mut self.tabs[id];
         match msg {
-            Msg::Pty(bytes) => {
-                self.parser.advance(&mut self.term, &bytes);
+            Msg::Pty(_, bytes) => {
+                tab.parser.advance(&mut tab.term, &bytes);
+                *needs_rebuild |= is_active;
+            }
+            Msg::PtyClosed(_) => {
+                let _ = tab.pty.child.wait();
+                if self.tabs.len() == 1 {
+                    // The last shell exiting is the window closing — the
+                    // tab stays in place so nothing observes an empty list.
+                    *exit = true;
+                    return;
+                }
+                self.tabs.remove(id);
+                if id < self.active {
+                    self.active -= 1;
+                } else if self.active >= self.tabs.len() {
+                    self.active = self.tabs.len() - 1;
+                }
+                if is_active {
+                    self.selecting = false;
+                    self.last_click = None;
+                    self.click_count = 0;
+                }
                 *needs_rebuild = true;
             }
-            Msg::PtyClosed => {
-                let _ = self.pty.child.wait();
-                *exit = true;
-            }
-            Msg::Term(event) => match event {
-                TermEvent::PtyWrite(s) => self.write_pty(s.clone().as_bytes()),
+            Msg::Term(_, event) => match event {
+                TermEvent::PtyWrite(s) => {
+                    let _ = tab.writer.write_all(s.as_bytes());
+                }
                 TermEvent::Title(t) => {
-                    self.title = Some(t);
-                    *needs_rebuild = true;
+                    tab.title = Some(t);
+                    *needs_rebuild |= is_active;
                 }
                 TermEvent::ResetTitle => {
-                    self.title = None;
-                    *needs_rebuild = true;
+                    tab.title = None;
+                    *needs_rebuild |= is_active;
                 }
                 TermEvent::ColorRequest(index, format) => {
-                    let rgb = self
-                        .term
-                        .colors()[index]
-                        .unwrap_or_else(|| colors::default_color(index, &self.settings.palette));
-                    let response = format(rgb);
-                    self.write_pty(response.as_bytes());
+                    let rgb = tab.term.colors()[index]
+                        .unwrap_or_else(|| colors::default_color(index, &palette));
+                    let _ = tab.writer.write_all(format(rgb).as_bytes());
                 }
                 TermEvent::TextAreaSizeRequest(format) => {
-                    let response = format(WindowSize {
-                        num_lines: self.rows,
-                        num_cols: self.cols,
-                        cell_width: self.settings.cell_w as u16,
-                        cell_height: self.settings.line_h as u16,
-                    });
-                    self.write_pty(response.as_bytes());
+                    let _ = tab.writer.write_all(format(window).as_bytes());
                 }
                 // OSC 52: programs storing to (or, if enabled in the term
                 // config, reading from) the system clipboards.
@@ -671,12 +898,11 @@ impl Application for TerminalApp {
                         ClipboardType::Selection => clip::paste_primary(),
                     }
                     .unwrap_or_default();
-                    let response = format(&text);
-                    self.write_pty(response.as_bytes());
+                    let _ = tab.writer.write_all(format(&text).as_bytes());
                 }
                 TermEvent::Bell => {
-                    self.bell = 1.0;
-                    *needs_rebuild = true;
+                    tab.bell = 1.0;
+                    *needs_rebuild |= is_active;
                 }
                 // Wakeup/cursor-blink: nothing to do.
                 _ => {}
@@ -685,21 +911,24 @@ impl Application for TerminalApp {
     }
 
     fn tick(&mut self, dt: f32, needs_rebuild: &mut bool) {
-        // Bell flash decay.
-        if self.bell > 0.0 {
-            self.bell = (self.bell - dt * 4.0).max(0.0);
-            *needs_rebuild = true;
+        // Bell flash decay — every tab's, so a background tab's flash has
+        // faded by the time it is shown rather than greeting the switch.
+        for (i, tab) in self.tabs.iter_mut().enumerate() {
+            if tab.bell > 0.0 {
+                tab.bell = (tab.bell - dt * 4.0).max(0.0);
+                *needs_rebuild |= i == self.active;
+            }
         }
 
         // Wheel glide / trackpad coast through the scrollback: advance the
         // line-unit motion and step the Term to its rounded offset, asking
         // for frames while it is still moving.
-        if self.scroll_motion.is_animating() {
+        if self.tab().scroll_motion.is_animating() {
             self.sync_scroll_motion();
-            if self.scroll_motion.is_animating() {
+            if self.tab().scroll_motion.is_animating() {
                 let bounds = self.scrollback_bounds();
-                self.scroll_motion.tick(dt, Bounds::max(0.0), bounds);
-                if self.apply_scroll_motion() || self.scroll_motion.is_animating() {
+                self.tab_mut().scroll_motion.tick(dt, Bounds::max(0.0), bounds);
+                if self.apply_scroll_motion() || self.tab().scroll_motion.is_animating() {
                     *needs_rebuild = true;
                 }
             }
@@ -723,9 +952,9 @@ impl Application for TerminalApp {
                 let lines = self.autoscroll_accum as i32;
                 if lines != 0 {
                     self.autoscroll_accum -= lines as f32;
-                    self.term.scroll_display(Scroll::Delta(lines));
+                    self.tab_mut().term.scroll_display(Scroll::Delta(lines));
                     let (point, side) = self.grid_point(self.last_pointer);
-                    if let Some(selection) = &mut self.term.selection {
+                    if let Some(selection) = &mut self.tab_mut().term.selection {
                         selection.update(point, side);
                     }
                     *needs_rebuild = true;
@@ -756,10 +985,7 @@ impl Application for TerminalApp {
         self.win_h = height;
         let (cols, rows) = self.grid_for(width, height);
         if (cols, rows) != (self.cols, self.rows) {
-            self.cols = cols;
-            self.rows = rows;
-            self.pty.resize(cols, rows);
-            self.term.resize(TermDims { cols, rows });
+            self.resize_tabs(cols, rows);
         }
     }
 
@@ -787,7 +1013,9 @@ impl Application for TerminalApp {
         let font = self.font.clone();
         let bounds = [pad, 0.0, w - pad, h];
 
-        let content = self.term.renderable_content();
+        let tab = self.tab();
+        let bell = tab.bell;
+        let content = tab.term.renderable_content();
         let display_offset = content.display_offset as i32;
         let overrides = content.colors;
         let cfg_palette = self.settings.palette;
@@ -999,8 +1227,8 @@ impl Application for TerminalApp {
         }
 
         // Visual bell: a brief foreground-tinted wash over the frame.
-        if self.bell > 0.0 {
-            pc.quad(frame, quad_color(cfg_palette.foreground, 0.12 * self.bell));
+        if bell > 0.0 {
+            pc.quad(frame, quad_color(cfg_palette.foreground, 0.12 * bell));
         }
 
         // The corner control over the grid, and its menu over everything.
@@ -1022,7 +1250,7 @@ impl Application for TerminalApp {
             self.ctrl_down = false;
             self.alt_down = false;
             self.mouse_buttons = 0;
-            if self.term.mode().contains(TermMode::FOCUS_IN_OUT) {
+            if self.tab().term.mode().contains(TermMode::FOCUS_IN_OUT) {
                 self.write_pty(if focused { b"\x1b[I" } else { b"\x1b[O" });
             }
         }
@@ -1046,13 +1274,13 @@ impl Application for TerminalApp {
             *needs_rebuild = true;
         }
         if self.mouse_reporting() && !self.selecting {
-            let mode = *self.term.mode();
+            let mode = *self.tab().term.mode();
             let motion_wanted = mode.contains(TermMode::MOUSE_MOTION)
                 || (mode.contains(TermMode::MOUSE_DRAG) && self.mouse_buttons != 0);
             if motion_wanted {
                 let cell = self.viewport_cell(pos);
-                if self.last_mouse_cell != Some(cell) {
-                    self.last_mouse_cell = Some(cell);
+                if self.tab().last_mouse_cell != Some(cell) {
+                    self.tab_mut().last_mouse_cell = Some(cell);
                     // Lowest held button, or 3 (no button) for plain motion.
                     let button = (0..3).find(|b| self.mouse_buttons & (1 << b) != 0).unwrap_or(3);
                     let code = 32 + button + self.report_mods();
@@ -1066,7 +1294,7 @@ impl Application for TerminalApp {
         }
         // Edge overshoot scrolls on tick's autoscroll clock, not per event.
         let (point, side) = self.grid_point(pos);
-        if let Some(selection) = &mut self.term.selection {
+        if let Some(selection) = &mut self.tab_mut().term.selection {
             selection.update(point, side);
             *needs_rebuild = true;
         }
@@ -1086,8 +1314,8 @@ impl Application for TerminalApp {
                 state,
                 pos.x,
                 pos.y,
-                self.term.selection.is_some(),
-                self.term.mode(),
+                self.tab().term.selection.is_some(),
+                self.tab().term.mode(),
                 self.shift_down
             );
         }
@@ -1129,7 +1357,7 @@ impl Application for TerminalApp {
                 let code = code + self.report_mods();
                 self.send_mouse_report(code, state == ElementState::Pressed, col, row);
                 if state == ElementState::Pressed {
-                    self.last_mouse_cell = Some((col, row));
+                    self.tab_mut().last_mouse_cell = Some((col, row));
                 }
             }
             return None;
@@ -1149,8 +1377,8 @@ impl Application for TerminalApp {
                     3 => SelectionType::Lines,
                     _ => SelectionType::Simple,
                 };
-                let had_selection = self.term.selection.is_some();
-                self.term.selection = Some(Selection::new(ty, point, side));
+                let had_selection = self.tab().term.selection.is_some();
+                self.tab_mut().term.selection = Some(Selection::new(ty, point, side));
                 self.selecting = true;
                 // Semantic/Lines are non-empty immediately; a fresh Simple
                 // press only needs a repaint if it cleared an old highlight.
@@ -1160,10 +1388,10 @@ impl Application for TerminalApp {
                 self.selecting = false;
                 // Empty selections (a plain click) drop; real ones go to
                 // PRIMARY, per the select-then-middle-click convention.
-                match self.term.selection_to_string() {
+                match self.tab().term.selection_to_string() {
                     Some(text) if !text.is_empty() => clip::copy_primary(&text),
                     _ => {
-                        if self.term.selection.take().is_some() {
+                        if self.tab_mut().term.selection.take().is_some() {
                             *needs_rebuild = true;
                         }
                     }
@@ -1202,7 +1430,7 @@ impl Application for TerminalApp {
             return;
         }
 
-        let mode = *self.term.mode();
+        let mode = *self.tab().term.mode();
         if mode.contains(TermMode::ALT_SCREEN) && mode.contains(TermMode::ALTERNATE_SCROLL) {
             // Full-screen apps without mouse reporting get arrow keys.
             let Some(lines) = self.take_whole_lines(lines) else { return };
@@ -1220,11 +1448,12 @@ impl Application for TerminalApp {
         self.sync_scroll_motion();
         let bounds = self.scrollback_bounds();
         let discrete = matches!(delta, MouseScrollDelta::LineDelta(..));
-        let moved = self.scroll_motion.apply_px(0.0, lines, discrete, Bounds::max(0.0), bounds);
+        let moved =
+            self.tab_mut().scroll_motion.apply_px(0.0, lines, discrete, Bounds::max(0.0), bounds);
         if moved && self.apply_scroll_motion() {
             *needs_rebuild = true;
         }
-        if self.scroll_motion.is_animating() {
+        if self.tab().scroll_motion.is_animating() {
             // A notch only moved the target; tick glides the view there.
             *needs_rebuild = true;
         }
@@ -1256,11 +1485,32 @@ impl Application for TerminalApp {
         // a bare Ctrl+C must still reach the shell as SIGINT.
         use cce_ui::widget::match_key_shortcut;
         if match_key_shortcut(event, &self.keys.copy) {
-            if let Some(text) = self.term.selection_to_string() {
+            if let Some(text) = self.tab().term.selection_to_string() {
                 if !text.is_empty() {
                     cce_ui::widget::clipboard::copy_to_clipboard(&text);
                 }
             }
+            return None;
+        }
+        // Tabs: the same operations the corner menu offers, by chord.
+        if match_key_shortcut(event, &self.keys.new_tab) {
+            self.new_tab();
+            *needs_rebuild = true;
+            return None;
+        }
+        if match_key_shortcut(event, &self.keys.close_tab) {
+            self.close_active_tab();
+            *needs_rebuild = true;
+            return None;
+        }
+        if match_key_shortcut(event, &self.keys.next_tab) {
+            self.cycle_tab(1);
+            *needs_rebuild = true;
+            return None;
+        }
+        if match_key_shortcut(event, &self.keys.prev_tab) {
+            self.cycle_tab(-1);
+            *needs_rebuild = true;
             return None;
         }
         if match_key_shortcut(event, &self.keys.paste) {
@@ -1272,23 +1522,24 @@ impl Application for TerminalApp {
             return None;
         }
         if match_key_shortcut(event, &self.keys.scroll_up) {
-            self.term.scroll_display(Scroll::PageUp);
+            self.tab_mut().term.scroll_display(Scroll::PageUp);
             *needs_rebuild = true;
             return None;
         }
         if match_key_shortcut(event, &self.keys.scroll_down) {
-            self.term.scroll_display(Scroll::PageDown);
+            self.tab_mut().term.scroll_display(Scroll::PageDown);
             *needs_rebuild = true;
             return None;
         }
 
-        if let Some(bytes) = encode_key(event, *self.term.mode()) {
+        if let Some(bytes) = encode_key(event, *self.tab().term.mode()) {
             self.write_pty(&bytes);
-            if self.term.selection.take().is_some() {
+            let term = &mut self.tab_mut().term;
+            if term.selection.take().is_some() {
                 *needs_rebuild = true;
             }
-            if self.term.grid().display_offset() != 0 {
-                self.term.scroll_display(Scroll::Bottom);
+            if term.grid().display_offset() != 0 {
+                term.scroll_display(Scroll::Bottom);
                 *needs_rebuild = true;
             }
         }
