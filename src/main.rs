@@ -543,6 +543,24 @@ impl TerminalApp {
         }
     }
 
+    /// How far a selection drag is holding the pointer past the top or
+    /// bottom edge padding: 0 when it is inside, negative above, positive
+    /// below. Drives the autoscroll rate in `tick`, and the frame cadence
+    /// `idle_poll_interval` has to ask for while it is non-zero.
+    fn autoscroll_overshoot(&self) -> f32 {
+        if !self.selecting {
+            return 0.0;
+        }
+        let y = self.last_pointer.y as f32;
+        if y < self.pad {
+            self.pad - y
+        } else if y > self.win_h - self.pad {
+            (self.win_h - self.pad) - y
+        } else {
+            0.0
+        }
+    }
+
     /// The scrollback offset's range: 0 (live bottom) ..= history length.
     fn scrollback_bounds(&self) -> Bounds {
         Bounds::max(self.tab().term.grid().history_size() as f32)
@@ -910,6 +928,19 @@ impl Application for TerminalApp {
         }
     }
 
+    /// Two things age in `tick` without redrawing anything the runner can
+    /// see: a background tab's bell flash (only the active tab's decay asks
+    /// for a frame) and selection autoscroll with the pointer held still in
+    /// the edge padding (motion events stop at the edge). Both are real-time
+    /// decays, and the runner's idle sleep clamps `dt` to one frame per
+    /// wake — so ask for frame cadence while either is live, and nothing
+    /// otherwise.
+    fn idle_poll_interval(&self) -> Option<std::time::Duration> {
+        let bell = self.tabs.iter().any(|t| t.bell > 0.0);
+        (bell || self.autoscroll_overshoot() != 0.0)
+            .then(|| std::time::Duration::from_millis(16))
+    }
+
     fn tick(&mut self, dt: f32, needs_rebuild: &mut bool) {
         // Bell flash decay — every tab's, so a background tab's flash has
         // faded by the time it is shown rather than greeting the switch.
@@ -937,15 +968,8 @@ impl Application for TerminalApp {
         // Selection autoscroll: while a drag holds the pointer in the top or
         // bottom edge padding, scroll at a rate scaling with the overshoot
         // (motion events stop at the edge, so this is time-driven).
-        if self.selecting {
-            let y = self.last_pointer.y as f32;
-            let overshoot = if y < self.pad {
-                self.pad - y
-            } else if y > self.win_h - self.pad {
-                (self.win_h - self.pad) - y
-            } else {
-                0.0
-            };
+        {
+            let overshoot = self.autoscroll_overshoot();
             if overshoot != 0.0 {
                 let rate = 4.0 + overshoot.abs().min(24.0) * 2.0; // lines/sec
                 self.autoscroll_accum += dt * rate * overshoot.signum();
