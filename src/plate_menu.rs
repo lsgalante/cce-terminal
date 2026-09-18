@@ -229,11 +229,9 @@ impl TerminalApp {
         // bounds equal to the menu rect, which the engine's text-occlusion
         // clamp exempts, so they render inside the menu while the grid's
         // text beneath stays clamped.
-        context_menu::paint(pc);
-        let (mx, my) = (context_menu::x(), context_menu::y());
-        let bounds = Some([mx, my, mx + context_menu::w(), my + context_menu::h()]);
-        for l in context_menu::text_labels() {
-            pc.text_with(l.text, l.x, l.y, l.font_size, l.color, None, bounds);
-        }
+        // Labels come with the plate: a TextLabel carries no family, so the
+        // hand-rolled label loop that used to live here passed None and drew
+        // the menu in the default sans rather than the DE's menu font.
+        context_menu::paint_with_labels(pc);
     }
 }
