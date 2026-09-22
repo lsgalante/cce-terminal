@@ -143,9 +143,8 @@ impl TerminalApp {
         if state != ElementState::Pressed {
             return true;
         }
-        let picked = if button == MouseButton::Left && context_menu::hit_test(px, py) {
-            let row = ((py - context_menu::y()) / context_menu::ROW_H).floor() as usize;
-            self.plate_menu_actions.get(row).copied()
+        let picked = if button == MouseButton::Left {
+            context_menu::row_at(px, py).and_then(|row| self.plate_menu_actions.get(row).copied())
         } else {
             None
         };
