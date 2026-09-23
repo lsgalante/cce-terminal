@@ -99,9 +99,53 @@ mod tests {
     /// Full round trip through a real shell: keystroke bytes in on the master,
     /// command output back out — the headless equivalent of typing into the
     /// window (the GUI path is `handle_key_input` → the same master fd).
+    ///
+    /// The child's whole environment is pinned through `env -i` rather than
+    /// inherited, and this is load-bearing twice over.
+    ///
+    /// It used to spawn `$SHELL` with the developer's environment, type a
+    /// command and let the shell `exit` — which is exactly when an
+    /// interactive shell flushes its history file. So `cargo test` appended
+    /// `printf 'RT-%s\n' OK; exit` to the developer's own shell history,
+    /// intermittently: it is a race with the `kill` below, and reproduced in
+    /// 2 runs out of 8. Appended rather than truncated, so nothing was lost,
+    /// but a test has no business writing there at all.
+    ///
+    /// A private `HOME` alone does NOT fix it. `HISTFILE` is commonly
+    /// exported from an rc file as an ABSOLUTE path — `export
+    /// HISTFILE="$HOME/.cache/.zsh_history"` is the shape — so the test
+    /// binary inherits it and the child writes through to the real one no
+    /// matter where its home points. Clearing the environment is what closes
+    /// that, and `HISTFILE=/dev/null` then covers the shells that would
+    /// otherwise default back into the private home.
+    ///
+    /// Second, `$SHELL` made the test mean something different on every
+    /// machine: it sourced the developer's rc files, so a slow, noisy or
+    /// interactive one could hang this or break its assertion, and a
+    /// non-POSIX login shell would not read the command at all. What is
+    /// under test is the pty plumbing — openpty, the controlling terminal,
+    /// the master round trip — not which binary the developer logs in with.
+    /// The cost is that `spawn_shell`'s `$SHELL` fallback is no longer
+    /// covered here; it is one `env::var` with a `/bin/sh` default.
     #[test]
     fn shell_round_trip() {
-        let mut pty = spawn_shell(80, 24, None, None).expect("openpty/spawn");
+        let home = std::env::temp_dir()
+            .join(format!("cce-terminal-test-home-{}", std::process::id()));
+        std::fs::create_dir_all(&home).expect("test home");
+        let argv: Vec<String> = [
+            "/usr/bin/env".to_string(),
+            "-i".to_string(),
+            "PATH=/usr/bin:/bin".to_string(),
+            format!("HOME={}", home.display()),
+            "HISTFILE=/dev/null".to_string(),
+            // spawn_shell sets these on the Command, and `env -i` would
+            // otherwise drop them before the shell ever sees them.
+            "TERM=alacritty".to_string(),
+            "COLORTERM=truecolor".to_string(),
+            "/bin/sh".to_string(),
+        ]
+        .to_vec();
+        let mut pty = spawn_shell(80, 24, Some(&argv), None).expect("openpty/spawn");
         let mut writer = pty.dup_handle().unwrap();
         let mut reader = pty.dup_handle().unwrap();
         writer.write_all(b"printf 'RT-%s\\n' OK; exit\r").unwrap();
@@ -127,5 +171,6 @@ mod tests {
         );
         let _ = pty.child.kill();
         let _ = pty.child.wait();
+        let _ = std::fs::remove_dir_all(&home);
     }
 }
