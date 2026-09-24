@@ -1017,19 +1017,9 @@ impl Application for TerminalApp {
         let (w, h) = (size.width, size.height);
         let mut pc = PaintCtx::new();
 
-        // The window plate, per the DE convention.
-        let mut plate = cce_ui::color::page_low_color();
-        if plate[3] > 0.001 {
-            plate[3] = cce_ui::color::root_plate_opacity();
-        }
-        // PlateSpec (cce-ui RFC 7b): the root plate wears the silhouette arc.
+        // The standard root plate (cce-ui `PlateSpec::window`).
+        pc.root_plate(w, h);
         let frame = Rect { x: 0.0, y: 0.0, width: w, height: h };
-        pc.plate_spec(&cce_ui::scene::paint::PlateSpec {
-            rect: frame,
-            material: cce_ui::scene::Material::opaque(plate),
-            window_corners: (true, true, true, true),
-            depth: cce_ui::layout::bevel_width(),
-        });
 
         let rows = self.rows as usize;
         let pad = self.pad;
