@@ -765,7 +765,8 @@ impl Application for TerminalApp {
         _qh: &QueueHandle<EngineState<Self>>,
         sender: calloop::channel::Sender<Self::Message>,
     ) -> Self {
-        let pad = cce_ui::layout::root_plate_padding();
+        // The window-edge inset: the root plate's roll plus one padding.
+        let pad = cce_ui::layout::root_plate_inset();
         // `.3` is the `fonts { terminal }` family (this was the 7-tuple's
         // fontconfig `terminal` alias before the DE's fonts moved into the
         // shared KDL config), falling back to Noto Sans Mono.
