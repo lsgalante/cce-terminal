@@ -194,7 +194,7 @@ impl TerminalApp {
             PlateMenuAction::CloseTab => self.close_active_tab(),
             PlateMenuAction::NewWindow => match std::env::current_exe() {
                 Ok(exe) => {
-                    if let Err(e) = cce_ui::process::spawn_detached(std::process::Command::new(exe)) {
+                    if let Err(e) = spawn_detached(std::process::Command::new(exe)) {
                         log::warn!("cce-terminal: failed to spawn a new window: {e}");
                     }
                 }
@@ -233,4 +233,16 @@ impl TerminalApp {
         // the menu in the default sans rather than the DE's menu font.
         context_menu::paint_with_labels(pc);
     }
+}
+
+/// Spawn `cmd` and reap it on a background thread, so the child never lingers
+/// as a zombie once it exits. This was `cce_ui::process::spawn_detached` until
+/// the toolkit dropped that module (cce-ui 4e94236) as caller-less — the new-window
+/// action here was a caller.
+fn spawn_detached(mut cmd: std::process::Command) -> std::io::Result<()> {
+    let mut child = cmd.spawn()?;
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+    Ok(())
 }
