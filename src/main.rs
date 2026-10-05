@@ -23,7 +23,8 @@
 //! circular trigger on the top-right that cce-designer's panes wear, opening
 //! a menu of the actions a menubar-less terminal has nowhere else to put —
 //! copy/paste, text zoom, scrollback and terminal resets, a new window, and
-//! the tabs. A tab ([`Tab`]) is one shell on one pty with its own `Term`,
+//! the tabs. A right-click on the grid opens the same menu at the pointer
+//! (Shift+right-click while a TUI has mouse reporting on). A tab ([`Tab`]) is one shell on one pty with its own `Term`,
 //! title, view offset and bell; the window shows the active one and the
 //! menu lists them as a radio group (the designer's dock-tab language) with
 //! New Tab / Close Tab. There is no tab bar: the title carries `[i/n]` while
@@ -1359,6 +1360,18 @@ impl Application for TerminalApp {
             && self.plate_corner_hit(px, py)
         {
             self.open_plate_menu();
+            *needs_rebuild = true;
+            return None;
+        }
+        // A right press opens it as a context menu at the pointer — unless
+        // the app owns the pointer, where the press is reported instead
+        // (Shift bypasses reporting, so the menu stays reachable there too).
+        // The selection is left alone, so Copy is offered for it.
+        if button == MouseButton::Right
+            && state == ElementState::Pressed
+            && !(self.mouse_reporting() && !self.selecting)
+        {
+            self.open_context_menu(px, py);
             *needs_rebuild = true;
             return None;
         }

@@ -1,7 +1,8 @@
 //! The root plate's corner control: the DE's circular menu trigger (the same
 //! affordance cce-designer's panes and cce-files' preview pane carry, on
 //! `cce_ui::widget::plate_dock`) riding the top-right of the terminal
-//! window, and the menu it opens.
+//! window, and the menu it opens. A right-click on the grid opens the same
+//! menu at the pointer, as a context menu.
 //!
 //! The terminal has one plate — the window itself — so the toolkit's dock
 //! vocabulary (collapse, detach) does not apply; the rows are the actions a
@@ -71,12 +72,34 @@ impl TerminalApp {
         context_menu::is_visible() && !self.plate_menu_actions.is_empty()
     }
 
-    /// Open the corner menu under its control. Rows are contextual: Copy
-    /// only with a selection to copy, Reset Text Size only while zoomed.
-    /// The menu hangs off the control's RIGHT edge, leftwards — anchored on
-    /// the left as the designer's panes do, it would run off the window.
+    /// Open the corner menu under its control. The menu hangs off the
+    /// control's RIGHT edge, leftwards — anchored on the left as the
+    /// designer's panes do, it would run off the window.
     pub(crate) fn open_plate_menu(&mut self) {
         let Some((cx, cy)) = self.plate_corner_center() else { return };
+        let (options, actions) = self.menu_rows();
+        // The menu sizes itself from its labels on `show`, so place it once
+        // to learn the width, then again with its right edge on the control.
+        let top = cy + CORNER_R;
+        context_menu::show(0.0, top, options.clone(), 0, NO_TARGET);
+        let left = (cx + CORNER_R - context_menu::w()).max(0.0);
+        context_menu::show(left, top, options, 0, NO_TARGET);
+        self.plate_menu_actions = actions;
+    }
+
+    /// Open the same menu as a context menu, its top-left at the pointer
+    /// (a right-click on the grid). No clamping here: the menu is its own
+    /// popup surface, and the positioner's constraint adjustment keeps it on
+    /// the output when the click is near the window's right or bottom edge.
+    pub(crate) fn open_context_menu(&mut self, px: f32, py: f32) {
+        let (options, actions) = self.menu_rows();
+        context_menu::show(px, py, options, 0, NO_TARGET);
+        self.plate_menu_actions = actions;
+    }
+
+    /// The rows, contextual: Copy only with a selection to copy, Reset Text
+    /// Size only while zoomed, Close Tab only with another tab to fall to.
+    fn menu_rows(&self) -> (Vec<String>, Vec<PlateMenuAction>) {
         let mut options: Vec<String> = Vec::new();
         let mut actions: Vec<PlateMenuAction> = Vec::new();
         let mut row = |label: &str, action: PlateMenuAction| {
@@ -111,14 +134,7 @@ impl TerminalApp {
         }
         row("-", PlateMenuAction::Separator);
         row("New Window", PlateMenuAction::NewWindow);
-
-        // The menu sizes itself from its labels on `show`, so place it once
-        // to learn the width, then again with its right edge on the control.
-        let top = cy + CORNER_R;
-        context_menu::show(0.0, top, options.clone(), 0, NO_TARGET);
-        let left = (cx + CORNER_R - context_menu::w()).max(0.0);
-        context_menu::show(left, top, options, 0, NO_TARGET);
-        self.plate_menu_actions = actions;
+        (options, actions)
     }
 
     pub(crate) fn close_plate_menu(&mut self) {
