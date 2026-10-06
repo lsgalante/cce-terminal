@@ -123,10 +123,12 @@ impl TerminalApp {
         row("-", PlateMenuAction::Separator);
         // The tabs as a RADIO group: every one listed, the shown one marked.
         // Clicking the marked row is a no-op (show_tab declines the active
-        // index), so the list reads as state, not just as actions.
+        // index), so the list reads as state, not just as actions. The marks
+        // are the shared menu's convention, drawn as the `circle` /
+        // `circle-outline` glyphs by `paint_with_labels`.
         for (i, tab) in self.tabs.iter().enumerate() {
-            let mark = if i == self.active { "●" } else { "○" };
-            row(&format!("{mark} {}", tab.label(i)), PlateMenuAction::ShowTab(tab.id));
+            let mark = if i == self.active { context_menu::MARK_ON } else { context_menu::MARK_OFF };
+            row(&format!("{mark}{}", tab.label(i)), PlateMenuAction::ShowTab(tab.id));
         }
         row("New Tab", PlateMenuAction::NewTab);
         if self.tabs.len() > 1 {
