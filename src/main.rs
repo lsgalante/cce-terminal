@@ -1206,10 +1206,17 @@ impl Application for TerminalApp {
 
         // Cursor last, over the glyphs. Only when visible in the viewport
         // (scrolled history moves it off) and not hidden by DECTCEM.
-        if cursor_shape != CursorShape::Hidden
+        let cursor_shown = cursor_shape != CursorShape::Hidden
             && mode.contains(TermMode::SHOW_CURSOR)
-            && (0..rows as i32).contains(&cursor_row)
-        {
+            && (0..rows as i32).contains(&cursor_row);
+        // A focused terminal always takes typing: say so, so a touch raises
+        // the on-screen keyboard. At the cursor cell when it is on screen,
+        // else the whole grid (a TUI hiding it, or scrolled history).
+        if self.focused {
+            let at = if cursor_shown { self.cell_rect(cursor_row as usize, cursor_col, 1) } else { frame };
+            cce_ui::text_input::claim(at.x, at.y, at.width, at.height);
+        }
+        if cursor_shown {
             let rect = self.cell_rect(cursor_row as usize, cursor_col, 1);
             if !self.focused {
                 // Hollow outline while unfocused.
