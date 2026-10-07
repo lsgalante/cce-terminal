@@ -1190,7 +1190,7 @@ impl Application for TerminalApp {
                 [run.fg.r, run.fg.g, run.fg.b],
                 Some(font.clone()),
                 Some(bounds),
-                TextAttrs { italic: run.italic, weight: run.bold.then_some(700) },
+                TextAttrs { italic: run.italic, weight: run.bold.then_some(700), ..Default::default() },
             );
         }
         for (row, start, end, rgb, is_strike) in deco_runs {
