@@ -60,11 +60,10 @@ use alacritty_terminal::term::{ClipboardType, Config as TermConfig, Term, TermMo
 use alacritty_terminal::vte::ansi::{
     Color as AnsiColor, CursorShape, NamedColor, Processor, Rgb,
 };
-use cce_ui::engine::{Application, EngineState, LogicalPosition, LogicalSize, WindowSettings};
+use cce_ui::engine::{Application, LogicalPosition, LogicalSize, WindowSettings};
 use cce_ui::scene::layout::Rect;
 use cce_ui::scene::paint::{DisplayList, PaintCtx, TextAttrs};
 use cce_ui::widget::{Bounds, ElementState, Key, KeyEvent, MouseButton, MouseScrollDelta, NamedKey, ScrollMotion};
-use wayland_client::QueueHandle;
 
 const INIT_W: u32 = 840;
 const INIT_H: u32 = 520;
@@ -762,10 +761,9 @@ struct TextRun {
 impl Application for TerminalApp {
     type Message = Msg;
 
-    fn new(
-        _qh: &QueueHandle<EngineState<Self>>,
-        sender: calloop::channel::Sender<Self::Message>,
-    ) -> Self {
+    fn create(sender: cce_ui::engine::AppSender<Self::Message>) -> Self {
+        // The app keeps calloop's sender; `AppSender` converts into it.
+        let sender: calloop::channel::Sender<Self::Message> = sender.into();
         // The window-edge inset: the root plate's roll plus one padding.
         let pad = cce_ui::layout::root_plate_inset();
         // `.3` is the `fonts { terminal }` family (this was the 7-tuple's
