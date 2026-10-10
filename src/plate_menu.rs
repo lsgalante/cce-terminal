@@ -15,6 +15,7 @@
 //! here — the same `plate_menu_actions` + `handle_plate_menu_click` contract
 //! as the designer.
 
+use cce_ui::process::spawn_detached;
 use alacritty_terminal::grid::Scroll;
 use alacritty_terminal::vte::ansi::Handler;
 use cce_ui::widget::plate_dock::{self, CORNER_R};
@@ -253,14 +254,3 @@ impl TerminalApp {
     }
 }
 
-/// Spawn `cmd` and reap it on a background thread, so the child never lingers
-/// as a zombie once it exits. This was `cce_ui::process::spawn_detached` until
-/// the toolkit dropped that module (cce-ui 4e94236) as caller-less — the new-window
-/// action here was a caller.
-fn spawn_detached(mut cmd: std::process::Command) -> std::io::Result<()> {
-    let mut child = cmd.spawn()?;
-    std::thread::spawn(move || {
-        let _ = child.wait();
-    });
-    Ok(())
-}
