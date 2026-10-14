@@ -237,7 +237,7 @@ impl TerminalApp {
     pub(crate) fn paint_plate_menu(&self, pc: &mut cce_ui::scene::paint::PaintCtx) {
         if let Some(c) = self.plate_corner_center() {
             let emphasized = self.plate_menu_open()
-                || plate_dock::corner_hit(c, self.last_pointer.x as f32, self.last_pointer.y as f32);
+                || plate_dock::corner_hit(c, self.last_pointer.x, self.last_pointer.y);
             plate_dock::draw_corner_dot(pc, c, emphasized);
         }
         if !self.plate_menu_open() {

@@ -484,9 +484,9 @@ impl TerminalApp {
 
     /// Pixel position → 0-based viewport cell (clamped).
     fn viewport_cell(&self, pos: LogicalPosition) -> (usize, usize) {
-        let col = (((pos.x as f32 - self.pad) / self.settings.cell_w).max(0.0) as usize)
+        let col = (((pos.x - self.pad) / self.settings.cell_w).max(0.0) as usize)
             .min(self.cols as usize - 1);
-        let row = (((pos.y as f32 - self.pad) / self.settings.line_h).max(0.0) as usize)
+        let row = (((pos.y - self.pad) / self.settings.line_h).max(0.0) as usize)
             .min(self.rows as usize - 1);
         (col, row)
     }
@@ -496,7 +496,7 @@ impl TerminalApp {
     /// cell was hit.
     fn grid_point(&self, pos: LogicalPosition) -> (Point, Side) {
         let (col, row) = self.viewport_cell(pos);
-        let col_f = ((pos.x as f32 - self.pad) / self.settings.cell_w).max(0.0);
+        let col_f = ((pos.x - self.pad) / self.settings.cell_w).max(0.0);
         let line = Line(row as i32 - self.tab().term.grid().display_offset() as i32);
         let side = if col_f.fract() > 0.5 { Side::Right } else { Side::Left };
         (Point::new(line, Column(col)), side)
@@ -551,7 +551,7 @@ impl TerminalApp {
         if !self.selecting {
             return 0.0;
         }
-        let y = self.last_pointer.y as f32;
+        let y = self.last_pointer.y;
         if y < self.pad {
             self.pad - y
         } else if y > self.win_h - self.pad {
@@ -1282,15 +1282,15 @@ impl Application for TerminalApp {
         }
         // The corner control's hover emphasis is a repaint; the open menu
         // takes the pointer exclusively (its own row hover).
-        let was_on_corner = self.plate_corner_hit(self.last_pointer.x as f32, self.last_pointer.y as f32);
+        let was_on_corner = self.plate_corner_hit(self.last_pointer.x, self.last_pointer.y);
         self.last_pointer = pos;
         if self.plate_menu_open() {
-            if cce_ui::widget::context_menu::cursor_moved(pos.x as f32, pos.y as f32) {
+            if cce_ui::widget::context_menu::cursor_moved(pos.x, pos.y) {
                 *needs_rebuild = true;
             }
             return;
         }
-        if self.plate_corner_hit(pos.x as f32, pos.y as f32) != was_on_corner {
+        if self.plate_corner_hit(pos.x, pos.y) != was_on_corner {
             *needs_rebuild = true;
         }
         if self.mouse_reporting() && !self.selecting {
@@ -1355,7 +1355,7 @@ impl Application for TerminalApp {
         // The corner menu, ahead of everything: an open menu owns every
         // button event, and a left press on the control opens it (and never
         // reaches the grid — not as a selection, not as a mouse report).
-        let (px, py) = (pos.x as f32, pos.y as f32);
+        let (px, py) = (pos.x, pos.y);
         if self.handle_plate_menu_input(button, state, px, py) {
             *needs_rebuild = true;
             return None;
