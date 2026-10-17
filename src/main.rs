@@ -30,6 +30,9 @@
 //! New Tab / Close Tab. There is no tab bar: the title carries `[i/n]` while
 //! more than one is open. Rebindable chords (`cce-terminal` domain in
 //! input.kdl): `new_tab`, `close_tab`, `next_tab`, `prev_tab`.
+//! A window reopens with the tabs it closed with, each a fresh shell in the
+//! directory its shell was in ([`resume`]): after `ccectl restart-app`, at
+//! login, or from the launcher.
 //!
 //! Config (KDL, live-reloaded on file change): a `terminal { … }` section in
 //! the shared `~/.config/cce/config.kdl` or the per-app
@@ -46,6 +49,7 @@ mod clip;
 mod colors;
 mod plate_menu;
 mod pty;
+mod resume;
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -237,6 +241,10 @@ struct Tab {
     bell: f32,
     /// Cell of the last motion report — motion is per-cell, not per-pixel.
     last_mouse_cell: Option<(usize, usize)>,
+    /// Where the shell started, for when /proc cannot say where it is now.
+    start_dir: Option<PathBuf>,
+    /// Runs the launch's argv command rather than a shell ([`resume`]).
+    command: bool,
 }
 
 impl Tab {
@@ -252,6 +260,7 @@ impl Tab {
         cwd: Option<&Path>,
     ) -> std::io::Result<Tab> {
         let pty = pty::spawn_shell(cols, rows, command, cwd)?;
+        let start_dir = cwd.filter(|d| d.is_dir()).map(Path::to_path_buf).or_else(|| std::env::current_dir().ok());
         let writer = pty.dup_handle()?;
         let mut reader = pty.dup_handle()?;
         let pty_sender = sender.clone();
@@ -290,6 +299,8 @@ impl Tab {
             scroll_motion: ScrollMotion::new(),
             bell: 0.0,
             last_mouse_cell: None,
+            start_dir,
+            command: command.is_some(),
         })
     }
 
@@ -314,6 +325,15 @@ impl Tab {
             let head: String = title.chars().take(MAX - 1).collect();
             format!("{head}…")
         }
+    }
+
+    /// What a restart brings back of this tab ([`resume`]); `None` once its
+    /// shell has exited.
+    fn saved(&mut self) -> Option<resume::SavedTab> {
+        if !matches!(self.pty.child.try_wait(), Ok(None)) {
+            return None;
+        }
+        Some(resume::SavedTab { cwd: self.cwd().or_else(|| self.start_dir.clone()), command: self.command })
     }
 
     /// Kill the shell and reap it. Closing a tab, not the shell exiting on
@@ -369,6 +389,8 @@ struct TerminalApp {
     zoom_steps: i32,
     /// Rows of the OPEN corner menu (empty = not open); see [`plate_menu`].
     plate_menu_actions: Vec<plate_menu::PlateMenuAction>,
+    /// Where this window's tabs are kept when it exits ([`resume`]).
+    launch: resume::Launch,
 }
 
 impl TerminalApp {
@@ -785,16 +807,37 @@ impl Application for TerminalApp {
             None => None,
         };
 
-        // The first tab runs the command (later tabs are plain shells) and
-        // inherits the terminal's own directory.
-        let first = Tab::spawn(TabId(0), cols, rows, &settings, &sender, command.as_deref(), None)
-            .expect("cce-terminal: failed to spawn shell on pty");
+        // The tabs this launch last closed with, if any ([`resume`]); else
+        // one, running the command (later tabs are plain shells) in the
+        // terminal's own directory.
+        let launch = resume::Launch::new(resume::path(), &argv);
+        let plan = resume::plan(command.is_some(), launch.take(), Path::is_dir);
+        let mut tabs = Vec::new();
+        let mut active = 0;
+        for (i, want) in plan.tabs.iter().enumerate() {
+            let cmd = command.as_deref().filter(|_| want.command);
+            match Tab::spawn(TabId(tabs.len() as u64), cols, rows, &settings, &sender, cmd, want.cwd.as_deref()) {
+                Ok(tab) => {
+                    if i <= plan.active {
+                        active = tabs.len();
+                    }
+                    tabs.push(tab);
+                }
+                Err(e) => log::warn!("cce-terminal: failed to restore a tab in {:?}: {e}", want.cwd),
+            }
+        }
+        if tabs.is_empty() {
+            let first = Tab::spawn(TabId(0), cols, rows, &settings, &sender, command.as_deref(), None)
+                .expect("cce-terminal: failed to spawn shell on pty");
+            tabs.push(first);
+        }
+        let next_tab_id = tabs.len() as u64;
 
         TerminalApp {
             sender,
-            tabs: vec![first],
-            active: 0,
-            next_tab_id: 1,
+            tabs,
+            active,
+            next_tab_id,
             font,
             pad,
             cols,
@@ -817,7 +860,23 @@ impl Application for TerminalApp {
             mouse_buttons: 0,
             zoom_steps: 0,
             plate_menu_actions: Vec::new(),
+            launch,
         }
+    }
+
+    /// Keep the live tabs for the next launch made the same way. A window
+    /// whose last shell exited has none, and keeps nothing.
+    fn on_exit(&mut self) {
+        let mut place = resume::Place::default();
+        for (i, tab) in self.tabs.iter_mut().enumerate() {
+            if let Some(saved) = tab.saved() {
+                if i <= self.active {
+                    place.active = place.tabs.len();
+                }
+                place.tabs.push(saved);
+            }
+        }
+        self.launch.push(&place);
     }
 
     fn settings(&self) -> WindowSettings {

@@ -265,6 +265,7 @@ dependencies = [
  "env_logger",
  "libc",
  "log",
+ "serde_json",
  "wayland-client",
 ]
 
